@@ -78,8 +78,8 @@ void population_engine_on_global_chat_mention(map_session_data *from_sd, const c
 /// team_id: 1 = enemy shells (target real players), 2 = allied shells (target team-1 shells).
 /// Returns total shells spawned (0 on error).
 int  population_engine_arena_start(const char* map_name, int shell_count,
-                                   int spawn_x = 0, int spawn_y = 0,
-                                   uint16_t job_override = 0, int team_id = 1);
+								   int spawn_x = 0, int spawn_y = 0,
+								   uint16_t job_override = 0, int team_id = 1);
 /// Arena PvP: release all arena shells on `map_name`.
 void population_engine_arena_stop(const char* map_name);
 
@@ -89,6 +89,11 @@ void population_engine_arena_stop(const char* map_name);
 std::vector<uint16_t> population_engine_arena_job_pool();
 
 struct block_list;
+struct party;
+int population_engine_companion_recruit(map_session_data* owner, uint16_t job_id);
+int population_engine_companion_dismiss(map_session_data* owner);
+void population_engine_restore_party(struct party* incoming);
+int population_engine_hangout_spawn(map_session_data* owner, uint16_t job_id);
 /// Arena PvP: classify the relation between two block_list entities so that
 /// `battle_check_target` can treat ally shells (team 2) as friendly to the
 /// real player on the same map and to each other, and enemy shells (team 1)
@@ -106,4 +111,4 @@ int population_engine_arena_relation(const block_list *s_bl, const block_list *t
 /// the autosupport subsystem.
 bool population_engine_arena_is_ally(const map_session_data *a, const map_session_data *b);
 
-#endif // POPULATION_ENGINE_HPP
+#endif /* POPULATION_ENGINE_HPP */

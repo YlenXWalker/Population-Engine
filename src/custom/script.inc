@@ -238,3 +238,25 @@ BUILDIN_FUNC(population_arena_jobs)
 	script_pushstrcopy(st, csv.c_str());
 	return SCRIPT_CMD_SUCCESS;
 }
+
+BUILDIN_FUNC(population_companion_recruit) {
+	map_session_data* sd;
+	if (!script_rid2sd(sd)) { script_pushint(st, 0); return SCRIPT_CMD_FAILURE; }
+	int job = script_getnum(st, 2);
+	script_pushint(st, job > 0 && job <= UINT16_MAX ? population_engine_companion_recruit(sd, static_cast<uint16_t>(job)) : 0);
+	return SCRIPT_CMD_SUCCESS;
+}
+BUILDIN_FUNC(population_companion_dismiss) {
+	map_session_data* sd;
+	if (!script_rid2sd(sd)) { script_pushint(st, 0); return SCRIPT_CMD_FAILURE; }
+	script_pushint(st, population_engine_companion_dismiss(sd));
+	return SCRIPT_CMD_SUCCESS;
+}
+BUILDIN_FUNC(population_hangout_spawn) {
+	map_session_data* sd;
+	if (!script_rid2sd(sd)) { script_pushint(st, 0); return SCRIPT_CMD_FAILURE; }
+	int job = script_getnum(st, 2);
+	// Placement is an administrator tool; ordinary players cannot populate maps.
+	script_pushint(st, sd->group->level >= 99 && job > 0 && job <= UINT16_MAX ? population_engine_hangout_spawn(sd, static_cast<uint16_t>(job)) : 0);
+	return SCRIPT_CMD_SUCCESS;
+}

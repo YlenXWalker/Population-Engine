@@ -282,6 +282,12 @@
     <ClCompile Include="path.cpp" />
     <ClCompile Include="pc.cpp" />
     <ClCompile Include="population_engine.cpp" />
+    <ClCompile Include="population_engine\population_combat.cpp" />
+    <ClCompile Include="population_engine\population_config.cpp" />
+    <ClCompile Include="population_engine\population_diagnostics.cpp" />
+    <ClCompile Include="population_engine\population_expanded_ai.cpp" />
+    <ClCompile Include="population_engine\population_runtime.cpp" />
+
     <ClCompile Include="pc_groups.cpp" />
     <ClCompile Include="pet.cpp" />
     <ClCompile Include="quest.cpp" />

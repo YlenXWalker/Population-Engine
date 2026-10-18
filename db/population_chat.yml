@@ -468,3 +468,7 @@ Body:
       - shop
       - greet
       - idle
+
+Footer:
+  Imports:
+  - Path: db/import/population_chat.yml

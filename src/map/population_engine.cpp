@@ -1,22 +1,21 @@
 // Copyright (c) rAthena Dev Teams - Licensed under GNU GPL
-// Copyright (c) Louis T Steinhil - https://github.com/YlenXWalker
 // For more information, see LICENCE in the main folder
 //
 // Population engine: spawns fake PC shells to fill maps with lifelike activity.
 // Includes wander AI, combat AI, ambient chat, and YAML-driven equipment/skill profiles.
+// Credits: Louis T Steinhil - https://github.com/YlenXWalker
 
 #include "population_engine.hpp"
 
-#include "population_engine/runtime/population_engine_combat.hpp"
-
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <set>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,6 +30,7 @@
 #include <common/strlib.hpp>
 #include <common/timer.hpp>
 #include <common/utils.hpp>
+
 #include "battle.hpp"
 #include "clif.hpp"
 #include "itemdb.hpp"
@@ -42,20 +42,16 @@
 #include "path.hpp"
 #include "pc.hpp"
 #include "pc_groups.hpp"
+#include "population_engine/population_combat.hpp"
+#include "population_engine/population_config.hpp"
+#include "population_engine/population_diagnostics.hpp"
+#include "population_engine/population_runtime.hpp"
+#include "population_engine/population_shell.hpp"
 #include "script.hpp"
 #include "skill.hpp"
 #include "status.hpp"
 #include "unit.hpp"
 #include "vending.hpp"
-
-#include "population_engine/config/population_config.hpp"
-#include "population_engine/config/population_yaml_types.hpp"
-#include "population_engine/core/population_engine_core.hpp"
-#include "population_engine/runtime/population_engine_path.hpp"
-
-// Unity-build: all submodule translation units compiled via the factory.
-#include "population_engine/population_engine_factory.cpp"
-#include "population_engine/core/pe_perf.hpp"
 
 std::vector<map_session_data *> g_population_engine_pcs;
 
@@ -77,8 +73,10 @@ struct PopVendorCacheBucket {
 	bool source_mids_built = false;
 };
 static std::unordered_map<std::string, PopVendorCacheBucket> g_pop_vendor_dyn_cache;
+static std::mutex g_pop_vendor_dyn_cache_mutex;
 
 void population_engine_vendor_dyn_cache_clear() {
+	std::lock_guard<std::mutex> lock(g_pop_vendor_dyn_cache_mutex);
 	g_pop_vendor_dyn_cache.clear();
 }
 
@@ -93,11 +91,73 @@ void population_engine_vendor_job_pool_clear() {
 static std::unordered_map<int32, t_tick> g_pop_chat_next_tick; ///< Per-shell next chat eligibility tick.
 static int32 g_pop_chat_timer = INVALID_TIMER;
 static int32 g_population_combat_global_timer = INVALID_TIMER;
+static int32 g_population_companion_timer = INVALID_TIMER;
+static std::unordered_set<int32> g_population_companions;
 static size_t g_chat_cursor = 0;    ///< Round-robin index for batched chat replies.
 // Last count written to cp_population_stats; UINT32_MAX = never written.
 static uint32_t g_last_db_written_count = UINT32_MAX;
 
 static const std::string kPopulationChatProfileDefault("default");
+
+struct PopulationShellCountIndex {
+	std::unordered_map<int16_t, size_t> by_map;
+	std::unordered_map<uint32_t, size_t> by_map_job;
+	std::unordered_map<int16_t, size_t> vendors_by_map;
+	bool dirty = true;
+};
+
+static PopulationShellCountIndex g_population_shell_count_index;
+
+static uint32_t population_shell_count_key(int16_t map_id, uint16_t job_id)
+{
+	return (static_cast<uint32_t>(static_cast<uint16_t>(map_id)) << 16) |
+		static_cast<uint32_t>(job_id);
+}
+
+static void population_engine_shell_index_mark_dirty()
+{
+	g_population_shell_count_index.dirty = true;
+}
+
+static void population_engine_shell_index_clear()
+{
+	g_population_shell_count_index.by_map.clear();
+	g_population_shell_count_index.by_map_job.clear();
+	g_population_shell_count_index.vendors_by_map.clear();
+	g_population_shell_count_index.dirty = false;
+}
+
+static void population_engine_shell_index_add(map_session_data *sd)
+{
+	if (!sd)
+		return;
+	if (g_population_shell_count_index.dirty)
+		return;
+	const int16_t map_id = sd->m;
+	const uint16_t job_id = static_cast<uint16_t>(sd->status.class_);
+	g_population_shell_count_index.by_map[map_id]++;
+	g_population_shell_count_index.by_map_job[population_shell_count_key(map_id, job_id)]++;
+	if (sd->state.vending)
+		g_population_shell_count_index.vendors_by_map[map_id]++;
+}
+
+static void population_engine_shell_index_rebuild()
+{
+	if (!g_population_shell_count_index.dirty)
+		return;
+	population_engine_shell_index_clear();
+	for (map_session_data *sd : g_population_engine_pcs) {
+		if (!sd)
+			continue;
+		if (!IS_POPULATION_ENGINE_ACCOUNT_ID(sd->status.account_id))
+			continue;
+		if (!sd->state.active || sd->prev == nullptr)
+			continue;
+		if (map_id2bl(sd->id) != sd)
+			continue;
+		population_engine_shell_index_add(sd);
+	}
+}
 
 /// If equipment omits ChatProfile:, use "default" from db/population_chat.yml (must exist).
 static const std::string& population_engine_chat_profile_key(const PopulationEngine* eq)
@@ -321,7 +381,7 @@ TIMER_FUNC(population_engine_chat_timer) {
 		if (map_id2bl(raw_sd->id) != raw_sd)
 			continue;
 
-		std::shared_ptr<PopulationEngine> equipment = population_engine_db_for_shell(raw_sd).find(raw_sd->status.class_);
+		std::shared_ptr<PopulationEngine> equipment = (raw_sd->pop.profile_config ? raw_sd->pop.profile_config : population_engine_db_for_shell(raw_sd).find(raw_sd->status.class_));
 
 		// Context-aware pool selection: vendor shells call out, arena shells taunt, hunters talk hunt, else idle/profile.
 		const std::vector<std::string>* pool = nullptr;
@@ -387,7 +447,7 @@ static bool population_engine_deliver_chat_reply_locked(map_session_data* bot_sd
 		ctx_category = "pvp_taunt";
 	else if (beh == PopulationBehavior::Vendor)
 		ctx_category = "shop";
-	else if (bot_sd->pop.target_id != 0 || (bot_sd->pop.mob_tracker.tracked_mobs.size() > 0))
+	else if (bot_sd->pop.target_id != 0 || !bot_sd->pop.mob_tracker.tracked_mobs.empty())
 		ctx_category = "hunt";
 	else if (beh == PopulationBehavior::Social || beh == PopulationBehavior::Wander)
 		ctx_category = "idle";
@@ -397,7 +457,7 @@ static bool population_engine_deliver_chat_reply_locked(map_session_data* bot_sd
 
 	// Fallback: profile pool (merged categories configured in population_chat.yml per profile).
 	if (!pool || pool->empty()) {
-		std::shared_ptr<PopulationEngine> equipment = population_engine_db_for_shell(bot_sd).find(bot_sd->status.class_);
+		std::shared_ptr<PopulationEngine> equipment = (bot_sd->pop.profile_config ? bot_sd->pop.profile_config : population_engine_db_for_shell(bot_sd).find(bot_sd->status.class_));
 		if (equipment == nullptr)
 			return false;
 		pool = population_chat_db().pool_for_profile(population_engine_chat_profile_key(equipment.get()));
@@ -444,6 +504,7 @@ static constexpr uint32_t POPULATION_ENGINE_INDEX_MAX = POPULATION_ENGINE_ACCOUN
 static std::atomic<uint32_t> g_next_population_engine_index(1);
 
 // Forward declarations.
+static void population_engine_start_shell_vendor(map_session_data* sd, const PopulationEngine* pop_cfg);
 static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, int y, uint32_t index,
 	uint16_t job_id, char sex, uint8_t hair_style, uint16_t hair_color,
 	uint16_t weapon, uint16_t shield, uint16_t head_top, uint16_t head_mid,
@@ -507,43 +568,34 @@ static void population_engine_destroy_failed_spawn(map_session_data* sd);
 /// Count population shells on a specific map.
 /// job_id = UINT16_MAX counts all jobs; otherwise counts only shells matching that job.
 static size_t population_engine_count_shells_on_map(int16_t map_id, uint16_t job_id = UINT16_MAX) {
-    size_t count = 0;
-    for (map_session_data* sd : g_population_engine_pcs) {
-        if (sd && sd->m == map_id) {
-            if (job_id == UINT16_MAX || sd->status.class_ == job_id)
-                count++;
-        }
-    }
-    return count;
+	population_engine_shell_index_rebuild();
+	if (job_id == UINT16_MAX) {
+		auto it = g_population_shell_count_index.by_map.find(map_id);
+		return it != g_population_shell_count_index.by_map.end() ? it->second : 0;
+	}
+	auto it = g_population_shell_count_index.by_map_job.find(population_shell_count_key(map_id, job_id));
+	return it != g_population_shell_count_index.by_map_job.end() ? it->second : 0;
 }
 
 /// Count shells whose job belongs to a given profile job list.
 /// Used by fill_category to compute the per-map deficit so the autosummon
 /// timer does not keep stacking shells onto maps that are already at quota.
 static size_t population_engine_count_shells_on_map_for_profile(
-        int16_t map_id, const std::vector<uint16_t>& jobs)
+		int16_t map_id, const std::vector<uint16_t>& jobs)
 {
-    size_t count = 0;
-    for (map_session_data* sd : g_population_engine_pcs) {
-        if (!sd || sd->m != map_id) continue;
-        const uint16_t c = static_cast<uint16_t>(sd->status.class_);
-        for (uint16_t j : jobs) {
-            if (c == j) { ++count; break; }
-        }
-    }
-    return count;
+	population_engine_shell_index_rebuild();
+	size_t count = 0;
+	for (uint16_t job_id : jobs) {
+		auto it = g_population_shell_count_index.by_map_job.find(population_shell_count_key(map_id, job_id));
+		if (it != g_population_shell_count_index.by_map_job.end())
+			count += it->second;
+	}
+	return count;
 }
 
 /// Count vendor-behavior shells (state.vending == 1) currently on a map.
 /// Used by the VendorPlacement-driven autosummon pass to enforce MaxVendors.
-static size_t population_engine_count_vendors_on_map(int16_t map_id) {
-    size_t count = 0;
-    for (map_session_data* sd : g_population_engine_pcs) {
-        if (sd && sd->m == map_id && sd->state.vending)
-            ++count;
-    }
-    return count;
-}
+
 
 
 
@@ -553,67 +605,79 @@ int32 population_engine_respawn_shell_timer(int32 tid, t_tick tick, int32 id, in
 // Tear down a partially constructed fake PC when spawn fails before map_quit runs.
 static void population_engine_destroy_failed_spawn(map_session_data* sd)
 {
-    if (!sd)
-        return;
+	if (!sd)
+		return;
 	g_pop_chat_next_tick.erase(sd->id);
 	population_engine_path_erase_for_pc(sd->id);
-    if (sd->regs.vars) {
-        sd->regs.vars->destroy(sd->regs.vars, script_reg_destroy);
-        sd->regs.vars = nullptr;
-    }
-    if (sd->regs.arrays) {
-        sd->regs.arrays->destroy(sd->regs.arrays, script_free_array_db);
-        sd->regs.arrays = nullptr;
-    }
-    sd->~map_session_data();
-    aFree(sd);
+	if (sd->regs.vars) {
+		sd->regs.vars->destroy(sd->regs.vars, script_reg_destroy);
+		sd->regs.vars = nullptr;
+	}
+	if (sd->regs.arrays) {
+		sd->regs.arrays->destroy(sd->regs.arrays, script_free_array_db);
+		sd->regs.arrays = nullptr;
+	}
+	sd->~map_session_data();
+	aFree(sd);
 }
 
 void population_engine_shell_release(map_session_data* sd)
 {
 	if (!sd)
 		return;
-	// Defensive guard: a kill cascade (e.g. Asura Strike against a mortal shell)
-	// can free `sd` out-of-band before the next stale-shell sweep runs. Touching
-	// `sd->sc` (an unordered_map) on freed memory crashes deep inside _Find_last.
-	// If the BL is no longer registered under this id, the shell has already been
-	// torn down by another path; bail before any further access.
-	if (map_id2bl(sd->id) != sd)
-		return;
-	sd->status.party_id = 0; // clear fake population party ID before teardown
-	g_pop_chat_next_tick.erase(sd->id);
-	population_engine_path_erase_for_pc(sd->id);
-	// Cancel a pending respawn timer so it doesn't fire on a freed/reused shell.
-	if (sd->pop.respawn_timer != INVALID_TIMER) {
-		const TimerData* td = get_timer(sd->pop.respawn_timer);
-		if (td && td->func == population_engine_respawn_shell_timer)
-			delete_timer(sd->pop.respawn_timer, population_engine_respawn_shell_timer);
-		sd->pop.respawn_timer = INVALID_TIMER;
-	}
-	population_engine_combat_shell_teardown(sd);
-	// Re-check after teardown: combat_changestate / hat-effect callbacks may have
-	// triggered map_quit on shells with non-zero action_on_end, freeing `sd`.
-	if (map_id2bl(sd->id) != sd)
-		return;
-	sd->pop.flags &= ~PSF::CombatActive;
-#ifdef SECURE_NPCTIMEOUT
-	if (sd->npc_idle_timer != INVALID_TIMER) {
-		const TimerData* td = get_timer(sd->npc_idle_timer);
-		if (td && td->func == npc_secure_timeout_timer)
-			delete_timer(sd->npc_idle_timer, npc_secure_timeout_timer);
-		sd->npc_idle_timer = INVALID_TIMER;
-	}
-#endif
-	sd->state.changemap = 0;
-	sd->state.warping = 0;
-	sd->state.connect_new = 0;
 
-	// Only call map_quit if the shell is still registered.  Any external path that
-	// calls map_quit on a shell (handle_shutdown, @kickall, etc.) will have already
-	// removed it from id_db via map_deliddb; skip here to avoid double unit_free.
-	if (map_id2bl(sd->id) != nullptr)
-		map_quit(sd);
+	// Phase 1: Map-level teardown — only if the shell is still registered on the map.
+	// A kill cascade (e.g. Asura Strike against a mortal shell) or an external map_quit
+	// (@kickall, handle_shutdown, etc.) may have already removed the shell from id_db
+	// via map_deliddb.  In that case skip map-level work but still proceed to Phase 2:
+	// fake PCs never reach chrif_auth_delete, so aFree and regs cleanup only happen here.
+	population_engine_shell_index_mark_dirty();
+	const bool on_map = (map_id2bl(sd->id) == sd);
 
+	if (g_population_companions.erase(sd->id) && sd->status.party_id) {
+		party_member_withdraw(sd->status.party_id, sd->status.account_id, sd->status.char_id,
+			sd->status.name, PARTY_MEMBER_WITHDRAW_LEAVE);
+	}
+	if (on_map) {
+		sd->status.party_id = 0; // clear fake population party ID before teardown
+		g_pop_chat_next_tick.erase(sd->id);
+		population_engine_path_erase_for_pc(sd->id);
+		// Cancel a pending respawn timer so it doesn't fire on a freed/reused shell.
+		if (sd->pop.respawn_timer != INVALID_TIMER) {
+			const TimerData* td = get_timer(sd->pop.respawn_timer);
+			if (td && td->func == population_engine_respawn_shell_timer)
+				delete_timer(sd->pop.respawn_timer, population_engine_respawn_shell_timer);
+			sd->pop.respawn_timer = INVALID_TIMER;
+		}
+		population_engine_combat_shell_teardown(sd);
+
+		// Re-check: combat_changestate / hat-effect callbacks may have triggered
+		// map_quit on shells with non-zero action_on_end, removing sd from id_db.
+		// For fake PCs map_quit never calls aFree (chrif_auth_delete is unreachable),
+		// so sd is still a valid allocation — only skip the remaining map-level work.
+		if (map_id2bl(sd->id) == sd) {
+			sd->pop.flags &= ~PSF::CombatActive;
+	#ifdef SECURE_NPCTIMEOUT
+			if (sd->npc_idle_timer != INVALID_TIMER) {
+				const TimerData* td = get_timer(sd->npc_idle_timer);
+				if (td && td->func == npc_secure_timeout_timer)
+					delete_timer(sd->npc_idle_timer, npc_secure_timeout_timer);
+				sd->npc_idle_timer = INVALID_TIMER;
+			}
+	#endif
+			sd->state.changemap = 0;
+			sd->state.warping = 0;
+			sd->state.connect_new = 0;
+
+			// Only call map_quit if the shell is still registered.  Any external path
+			// that calls map_quit on a shell will have already removed it from id_db
+			// via map_deliddb; skip here to avoid double unit_free.
+			if (map_id2bl(sd->id) != nullptr)
+				map_quit(sd);
+		}
+	}
+
+	// Phase 2: Resource cleanup — ALWAYS runs.
 	// map_quit → unit_free_pc → unit_free handles sc_display, quest_log, bonus_script, etc.
 	// Fake PCs never reach chrif_auth_delete, so the raw C hash tables in regs must be
 	// freed here manually; unit_free does not touch them.
@@ -641,6 +705,7 @@ std::vector<map_session_data*> population_engine_collect_stale_shells()
 		if (!sd || !population_engine_is_population_pc(sd->id) || !population_engine_combat_shell_ac_ok(sd)) {
 			stale.push_back(sd);
 			it = g_population_engine_pcs.erase(it);
+			population_engine_shell_index_mark_dirty();
 			if (g_population_engine_count.load() > 0)
 				g_population_engine_count--;
 			if (g_population_engine_stats.active_units > 0)
@@ -701,8 +766,9 @@ static uint32_t population_engine_allocate_index()
 ///                  population target via PopulationVendorPlacement::max_vendors.
 /// Returns the number of shells actually spawned.
 static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint = UINT16_MAX,
-                                  size_t* tick_budget = nullptr, uint8_t map_category = 0,
-                                  bool bypass_existing_check = false)
+								  size_t* tick_budget = nullptr, uint8_t map_category = 0,
+								  bool bypass_existing_check = false,
+		std::shared_ptr<PopulationEngine> profile_override = nullptr, int fixed_x = -1, int fixed_y = -1)
 {
 	if (want == 0)
 		return 0;
@@ -730,10 +796,8 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 
 	// Pre-compute vendor placement and build the vendor position snapshot once for the
 	// entire batch to avoid O(N_slots × N_shells) re-walks of g_population_engine_pcs.
-	const PopulationVendorPlacement *map_vp =
-		population_vendor_db().vendor_placement_for_map(std::string(mapdata->name));
 	std::vector<std::pair<int16, int16>> vendor_positions_here;
-	if (map_vp && (map_vp->min_spacing > 0 || map_vp->max_vendors > 0)) {
+	if (population_vendor_db().any_vendor_placements()) {
 		vendor_positions_here.reserve(g_population_engine_pcs.size());
 		for (auto* psd : g_population_engine_pcs) {
 			if (!psd || psd->m != map_id) continue;
@@ -754,29 +818,12 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 		const uint16_t pre_job_id = (job_hint != UINT16_MAX && pcdb_checkid(job_hint))
 			? job_hint : get_random_job_id();
 		PopulationDbSource pre_src = PopulationDbSource::Main;
-		auto pre_equipment = population_engine_find_any(pre_job_id, &pre_src);
+		auto pre_equipment = profile_override ? profile_override : population_engine_find_any(pre_job_id, &pre_src);
+		if (profile_override && !profile_override->vendor_key.empty()) pre_src = PopulationDbSource::Vendor;
 		if (!pre_equipment) {
 			const uint16_t base_job = get_base_job(pre_job_id);
 			if (base_job != pre_job_id)
 				pre_equipment = population_engine_find_any(base_job, &pre_src);
-		}
-		// For town spawns (map_category==1), if the resolved entry doesn't have Vendor as its
-		// town_behavior, check vendor_pop_db directly — it may have a VendorKey and the right
-		// town_behavior even if the engine.yml entry shadows it in the general lookup.
-		if (map_category == 1 && pre_equipment &&
-		    pre_equipment->town_behavior != PopulationBehavior::Vendor) {
-			if (auto vp = population_vendor_pop_db().find(pre_job_id)) {
-				pre_src      = PopulationDbSource::Vendor;
-				pre_equipment = vp;
-			} else {
-				const uint16_t base_job = get_base_job(pre_job_id);
-				if (base_job != pre_job_id) {
-					if (auto vp2 = population_vendor_pop_db().find(base_job)) {
-						pre_src       = PopulationDbSource::Vendor;
-						pre_equipment = vp2;
-					}
-				}
-			}
 		}
 		PopulationBehavior eff_beh = pre_equipment ? pre_equipment->behavior : PopulationBehavior::Combat;
 		if (pre_equipment) {
@@ -790,7 +837,8 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 		const bool is_vendor_spawn = (eff_beh == PopulationBehavior::Vendor);
 
 		// Vendor placement — use the map-level entry pre-computed before the slot loop.
-		const PopulationVendorPlacement *vp = is_vendor_spawn ? map_vp : nullptr;
+		const PopulationVendorPlacement *vp = is_vendor_spawn && pre_equipment
+			? population_vendor_db().placement(pre_equipment->vendor_key, mapdata->name) : nullptr;
 
 		// When ANY VendorPlacement entries exist, vendor-behavior shells are
 		// restricted to the listed maps only. A vendor spawn on a map with no
@@ -801,7 +849,10 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 		// Enforce MaxVendors cap. vendor_positions_here was built before this loop
 		// and is updated after each successful vendor spawn below.
 		if (vp && vp->max_vendors > 0 &&
-		    static_cast<int>(vendor_positions_here.size()) >= vp->max_vendors)
+			std::count_if(g_population_engine_pcs.begin(), g_population_engine_pcs.end(), [&](auto* bot) {
+				return bot && bot->m == map_id && bot->pop.profile_config && pre_equipment &&
+					bot->pop.profile_config->vendor_key == pre_equipment->vendor_key;
+			}) >= vp->max_vendors)
 			continue; // map full of vendors already
 
 		// Find a walkable spawn position.
@@ -824,8 +875,7 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 				lo_y = std::max<int16_t>(0, vp->area_y1);
 				hi_x = std::min<int16_t>(static_cast<int16_t>(mapdata->xs - 1), vp->area_x2);
 				hi_y = std::min<int16_t>(static_cast<int16_t>(mapdata->ys - 1), vp->area_y2);
-				if (hi_x <= lo_x) hi_x = static_cast<int16_t>(lo_x + 1);
-				if (hi_y <= lo_y) hi_y = static_cast<int16_t>(lo_y + 1);
+				if (hi_x < lo_x || hi_y < lo_y) continue;
 			}
 
 			// Distance check vs the snapshot taken above (no mutex in inner loop).
@@ -834,7 +884,7 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 				if (spacing <= 0) return true;
 				for (const auto &p : vendor_positions_here) {
 					if (std::abs(static_cast<int>(p.first)  - tx) <= spacing &&
-					    std::abs(static_cast<int>(p.second) - ty) <= spacing)
+						std::abs(static_cast<int>(p.second) - ty) <= spacing)
 						return false;
 				}
 				return true;
@@ -842,8 +892,8 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 
 			const int max_attempts = vp ? 60 : 20;
 			for (int attempt = 0; attempt < max_attempts; ++attempt) {
-				const int16_t span_x = static_cast<int16_t>(std::max<int16_t>(1, hi_x - lo_x));
-				const int16_t span_y = static_cast<int16_t>(std::max<int16_t>(1, hi_y - lo_y));
+				const int16_t span_x = static_cast<int16_t>(std::max<int16_t>(1, hi_x - lo_x + 1));
+				const int16_t span_y = static_cast<int16_t>(std::max<int16_t>(1, hi_y - lo_y + 1));
 				sx = static_cast<int16_t>(lo_x + (rnd() % span_x));
 				sy = static_cast<int16_t>(lo_y + (rnd() % span_y));
 				if (sx >= mapdata->xs) sx = static_cast<int16_t>(mapdata->xs - 1);
@@ -861,20 +911,12 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 					x = sx; y = sy;
 				}
 			}
-			if (x == 0 && y == 0 && vp) {
-				// Placement-constrained fallback: scan from a random center inside
-				// the placement area. Honors the area but ignores spacing as a
-				// last resort so vendors actually appear on small/dense maps.
-				const int16_t span_x = static_cast<int16_t>(std::max<int16_t>(1, hi_x - lo_x));
-				const int16_t span_y = static_cast<int16_t>(std::max<int16_t>(1, hi_y - lo_y));
-				sx = static_cast<int16_t>(lo_x + (rnd() % span_x));
-				sy = static_cast<int16_t>(lo_y + (rnd() % span_y));
-				if (map_search_freecell(nullptr, map_id, &sx, &sy,
-					std::min<int16_t>(static_cast<int16_t>(span_x / 2 + 4), 20),
-					std::min<int16_t>(static_cast<int16_t>(span_y / 2 + 4), 20), 1)) {
-					x = sx; y = sy;
-				}
-			}
+
+		}
+		if (fixed_x >= 0 && fixed_y >= 0) {
+			if (fixed_x >= mapdata->xs || fixed_y >= mapdata->ys ||
+				!map_getcell(map_id, fixed_x, fixed_y, CELL_CHKPASS)) continue;
+			x = fixed_x; y = fixed_y;
 		}
 		if (x == 0 && y == 0)
 			continue; // No walkable cell found for this slot; skip.
@@ -941,7 +983,9 @@ static size_t autosummon_fill_map(int16_t map_id, size_t want, uint16_t job_hint
 			0 /*option*/, cloth_color, garment, init_script, skip_arrow, pop_cfg, map_category, pre_src);
 
 		if (sd) {
+			sd->pop.profile_config = equipment;
 			g_population_engine_pcs.push_back(sd);
+			population_engine_shell_index_add(sd);
 			g_population_engine_count++;
 			g_population_engine_stats.total_created++;
 			g_population_engine_stats.active_units++;
@@ -979,6 +1023,35 @@ static void population_engine_write_count_sql(uint32_t count)
 	g_last_db_written_count = count;
 }
 
+static bool population_engine_select_vendor_spawn(const std::vector<std::shared_ptr<PopulationEngine>>& profiles,
+	const std::unordered_set<std::string>& excluded, std::shared_ptr<PopulationEngine>& selected, int16& selected_map)
+{
+	selected.reset();
+	selected_map = -1;
+		size_t least = SIZE_MAX;
+		for (const auto& profile : profiles) {
+			if (!profile || (profile->town_behavior != PopulationBehavior::Vendor && profile->behavior != PopulationBehavior::Vendor)) continue;
+			auto placements = population_vendor_db().placements().find(profile->vendor_key);
+			if (placements == population_vendor_db().placements().end()) continue;
+			for (const auto& pair : placements->second) {
+				const auto& vp = pair.second;
+				const int16 mid = map_mapname2mapid(vp.map.c_str());
+				if (mid < 0 || excluded.count(profile->vendor_key + "@" + vp.map)) continue;
+				size_t key_count = 0, profile_count = 0;
+				for (auto* bot : g_population_engine_pcs) {
+					if (!bot || bot->m != mid || !bot->pop.profile_config) continue;
+					if (bot->pop.profile_config->vendor_key == profile->vendor_key) ++key_count;
+					if (bot->pop.profile_config == profile) ++profile_count;
+				}
+				const size_t target = vp.max_vendors > 0 ? static_cast<size_t>(vp.max_vendors) : 12;
+				if (key_count < target && profile_count < least) {
+					selected = profile; selected_map = mid; least = profile_count;
+				}
+			}
+		}
+	return selected != nullptr;
+}
+
 TIMER_FUNC(population_engine_autosummon_timer)
 {
 	PE_PERF_SCOPE("timer.autosummon");
@@ -992,20 +1065,25 @@ TIMER_FUNC(population_engine_autosummon_timer)
 	for (map_session_data *sd : g_population_engine_pcs) {
 		if (!sd || !sd->state.active || sd->prev == nullptr)
 			continue;
-		if (sd->pop.spawn_map_id < 0 || sd->m == sd->pop.spawn_map_id)
+		if (sd->pop.companion_owner || sd->pop.spawn_map_id < 0 || sd->m == sd->pop.spawn_map_id)
 			continue;
 		struct map_data *mapdata = map_getmapdata(sd->pop.spawn_map_id);
 		if (!mapdata)
 			continue;
 		drift_candidates.push_back({sd, mapdata->index,
-		    sd->pop.spawn_x, sd->pop.spawn_y});
+			sd->pop.spawn_x, sd->pop.spawn_y});
 	}
 	// Map-drift check: shells that left their designated spawn map get warped back.
+	bool drifted_any = false;
 	for (auto &e : drift_candidates) {
 		block_list *bl = map_id2bl(e.sd->id);
-		if (bl && BL_CAST(BL_PC, bl) == e.sd)
+		if (bl && BL_CAST(BL_PC, bl) == e.sd) {
 			pc_setpos(e.sd, e.mapindex, e.x, e.y, CLR_TELEPORT);
+			drifted_any = true;
+		}
 	}
+	if (drifted_any)
+		population_engine_shell_index_mark_dirty();
 
 	// Sync active count to DB so FluxCP can display it on the website.
 	{
@@ -1025,7 +1103,7 @@ TIMER_FUNC(population_engine_autosummon_timer)
 	size_t* pbudget = (batch_cfg > 0) ? &tick_budget : nullptr;
 
 	for (auto it = population_spawn_db().begin();
-	     it != population_spawn_db().end(); ++it)
+		 it != population_spawn_db().end(); ++it)
 	{
 		if (!it->second)
 			continue;
@@ -1083,60 +1161,45 @@ TIMER_FUNC(population_engine_autosummon_timer)
 		if (fill_category(se.dungeons, se.dungeons_population, se.dungeons_max_per_map, 3)) return 0;
 	}
 
-	// VendorPlacement-driven pass: directly fill maps listed under VendorPlacement
-	// up to MaxVendors using vendor-behavior jobs from population_engine.yml.
-	// Without this, a map referenced ONLY by VendorPlacement (e.g. prt_mk) would
-	// never receive vendors because population_spawn_db has no entry for it.
-	{
-		// Build (cached) list of jobs whose effective behavior is Vendor in any
-		// category (base, town, field, or dungeon). Cleared on YAML reload via
-		// population_engine_vendor_job_pool_clear().
-		if (!g_pop_vendor_job_pool_built) {
-			// Vendor jobs live in db/population_vendor_pop.yml. Falls back to the
-			// main DB only if the vendor DB is empty (e.g. file missing on disk).
-			PopulationEngineDatabase& vsrc = population_vendor_pop_db().size() > 0
-				? population_vendor_pop_db()
-				: population_engine_db();
-			for (auto it = vsrc.begin(); it != vsrc.end(); ++it) {
-				if (!it->second) continue;
-				const PopulationEngine &pe = *it->second;
-				const bool is_vendor =
-					pe.behavior         == PopulationBehavior::Vendor ||
-					pe.town_behavior    == PopulationBehavior::Vendor ||
-					pe.field_behavior   == PopulationBehavior::Vendor ||
-					pe.dungeon_behavior == PopulationBehavior::Vendor;
-				if (is_vendor)
-					g_pop_vendor_job_pool.push_back(it->first);
-			}
-			g_pop_vendor_job_pool_built = true;
-		}
-
-		if (!g_pop_vendor_job_pool.empty() && population_vendor_db().any_vendor_placements()) {
-			for (const auto &kv : population_vendor_db().vendor_placements()) {
-				if (pbudget != nullptr && *pbudget == 0) break;
-				if (g_population_engine_count.load() >= max_global) break;
-
-				const PopulationVendorPlacement &vp = kv.second;
-				const int target = vp.max_vendors > 0 ? vp.max_vendors : 12; // sensible default
-				const int16 mid  = map_mapname2mapid(vp.map.c_str());
-				if (mid < 0) continue;
-
-				const size_t cur = population_engine_count_vendors_on_map(mid);
-				const size_t deficit = static_cast<size_t>(target) > cur ? static_cast<size_t>(target) - cur : 0;
-				if (deficit == 0) continue;
-
-				for (size_t d = 0; d < deficit; ++d) {
-					if (pbudget != nullptr && *pbudget == 0) break;
-					if (g_population_engine_count.load() >= max_global) break;
-					const uint16_t vjob = g_pop_vendor_job_pool[rnd() % g_pop_vendor_job_pool.size()];
-					// map_category=1: selects town_behavior override (Vendor on merchant jobs).
-					// bypass_existing_check=true: placement pass owns the count via
-					// population_engine_count_vendors_on_map above; the per-job gate in
-					// autosummon_fill_map would otherwise stop at one shell per unique job.
-					autosummon_fill_map(mid, 1, vjob, pbudget, 1, /*bypass_existing_check=*/true);
-				}
+	// One permanent hangout at each configured post. Posts are map-thread owned.
+	for (auto it = population_spawn_db().begin(); it != population_spawn_db().end(); ++it) {
+		if (!it->second) continue;
+		const auto& entry = *it->second;
+		const auto jobs = population_engine_db().jobs_with_profile(entry.profile_name);
+		if (jobs.empty()) continue;
+		for (size_t i = 0; i < entry.posts.size(); ++i) {
+			if ((pbudget && !*pbudget) || g_population_engine_count.load() >= max_global) break;
+			const auto& post = entry.posts[i];
+			const std::string key = entry.profile_name + "@" + std::to_string(i);
+			if (std::any_of(g_population_engine_pcs.begin(), g_population_engine_pcs.end(), [&](auto* bot) {
+				return bot && bot->pop.post_key == key;
+			})) continue;
+			const int16 mid = map_mapname2mapid(post.map.c_str());
+			if (mid < 0) continue;
+			const auto job = jobs[rnd() % jobs.size()];
+			if (autosummon_fill_map(mid, 1, job, pbudget, 1, true, population_engine_db().find(job), post.x, post.y)) {
+				auto* bot = g_population_engine_pcs.back();
+				bot->pop.post_key = key;
+				bot->pop.behavior = bot->pop.behavior_base = static_cast<uint8>(PopulationBehavior::Hangout);
+				population_engine_path_erase_for_pc(bot->id);
+				pc_setsit(bot); clif_sitting(*bot);
+				population_engine_combat_start_session(bot, PopulationCombatStartMode::AutoCombat, -1, SCSTART_NOAVOID);
 			}
 		}
+	}
+
+	// Fill by vendor identity. Repeated job classes are independent profiles.
+	// Choose the least represented profile/key first so large shop catalogs
+	// receive one of each before any profile receives a duplicate.
+	const auto& profiles = population_vendor_pop_db().shell_profiles();
+	std::unordered_set<std::string> excluded;
+	for (size_t pass = 0; pass < max_global; ++pass) {
+		std::shared_ptr<PopulationEngine> selected;
+		int16 selected_map = -1;
+		population_engine_select_vendor_spawn(profiles, excluded, selected, selected_map);
+		if (!selected || (pbudget && *pbudget == 0) || g_population_engine_count.load() >= max_global) break;
+		if (!autosummon_fill_map(selected_map, 1, selected->job_id, pbudget, 1, true, selected))
+			excluded.insert(selected->vendor_key + "@" + map_mapid2mapname(selected_map));
 	}
 
 	return 0;
@@ -1249,21 +1312,33 @@ TIMER_FUNC(population_engine_respawn_shell_timer)
 
 	unit_remove_map(sd, CLR_RESPAWN);
 	pc_setpos(sd, mapdata->index, sx, sy, CLR_OUTSIGHT);
+	population_engine_shell_index_mark_dirty();
 	status_revive(sd, 100, 100);
 	status_calc_pc(sd, SCO_FORCE);
 	sd->ud.canmove_tick = 0;
 	sd->ud.canact_tick  = 0;
-	sd->pop.target_id           = 0;
+	sd->pop.target_id          = 0;
 	sd->pop.sticky_target_id    = 0;
 	sd->pop.last_cast_skill_id  = 0;
 	sd->pop.last_damage_received = 0;
 	sd->pop.last_attacked_tick  = 0;
 	sd->pop.last_skill_used_on_me = 0;
+	sd->pop.path.clear();
+	sd->pop.path_index = 0;
+	sd->pop.path_last_calc_tick = 0;
+	sd->pop.path_exec_fail_count = 0;
+	sd->pop.recently_cleared_targets.clear();
 	sd->pop.skill_next_use_tick.clear();
+	sd->pop.active_buffs.clear();
+	sd->pop.mob_tracker.tracked_mobs.clear();
+	sd->pop.mob_tracker.last_scan = 0;
+	sd->pop.detection_cache.cached_monsters.clear();
+	sd->pop.detection_cache.cached_items.clear();
+	sd->pop.detection_cache.last_update = 0;
 
 	// Re-register chat state (erased by shell_release during death processing).
 	{
-		std::shared_ptr<PopulationEngine> equipment = population_engine_db_for_shell(sd).find(sd->status.class_);
+		std::shared_ptr<PopulationEngine> equipment = (sd->pop.profile_config ? sd->pop.profile_config : population_engine_db_for_shell(sd).find(sd->status.class_));
 		if (equipment)
 			population_engine_register_shell_chat_state(sd, equipment.get());
 	}
@@ -1271,15 +1346,19 @@ TIMER_FUNC(population_engine_respawn_shell_timer)
 	// Re-enable wander for shells that wander when not in combat.
 	const auto beh = static_cast<PopulationBehavior>(sd->pop.behavior);
 	if (beh == PopulationBehavior::Wander || beh == PopulationBehavior::Guard ||
-	    beh == PopulationBehavior::Support || beh == PopulationBehavior::Social)
+		beh == PopulationBehavior::Support || beh == PopulationBehavior::Social)
 		population_engine_register_shell_wander_state(sd);
 
 	// Re-arm the CombatActive flag (cleared by unit_remove_map / state teardown).
 	sd->pop.flags |= PSF::CombatActive;
 
 	// Restart the combat session for battle-oriented behaviors so the combat timer picks them up.
-	if (beh == PopulationBehavior::Combat || beh == PopulationBehavior::Guard)
+	if (beh == PopulationBehavior::Combat || beh == PopulationBehavior::Guard || beh == PopulationBehavior::Hangout)
 		population_engine_combat_start_session(sd, PopulationCombatStartMode::AutoCombat, 0, 0);
+	if (beh == PopulationBehavior::Vendor && !sd->state.vending) {
+		auto equipment = sd->pop.profile_config ? sd->pop.profile_config : population_engine_db_for_shell(sd).find(sd->status.class_);
+		population_engine_start_shell_vendor(sd, equipment.get());
+	}
 	return 0;
 }
 
@@ -1315,7 +1394,7 @@ void population_engine_on_shell_kills_player(map_session_data *killer_sd, map_se
 	const std::vector<std::string>* pool = population_chat_db().lines_for_category("pvp_kill");
 	if (!pool || pool->empty()) {
 		// Fallback: find the shell's profile pool.
-		std::shared_ptr<PopulationEngine> equipment = population_engine_db_for_shell(killer_sd).find(killer_sd->status.class_);
+		std::shared_ptr<PopulationEngine> equipment = (killer_sd->pop.profile_config ? killer_sd->pop.profile_config : population_engine_db_for_shell(killer_sd).find(killer_sd->status.class_));
 		if (equipment)
 			pool = population_chat_db().pool_for_profile(population_engine_chat_profile_key(equipment.get()));
 	}
@@ -1345,8 +1424,124 @@ void population_engine_on_shell_kills_player(map_session_data *killer_sd, map_se
 	g_pop_chat_next_tick[killer_sd->id] = now + static_cast<t_tick>(cd > 0 ? cd : 5000);
 }
 
+
+static void population_engine_remove_managed_shell(map_session_data* bot) {
+	g_population_engine_pcs.erase(std::remove(g_population_engine_pcs.begin(), g_population_engine_pcs.end(), bot), g_population_engine_pcs.end());
+	if (g_population_engine_count.load()) --g_population_engine_count;
+	if (g_population_engine_stats.active_units) --g_population_engine_stats.active_units;
+	population_engine_shell_release(bot);
+}
+
+TIMER_FUNC(population_engine_companion_timer) {
+	std::vector<map_session_data*> dismiss;
+	for (int32 aid : g_population_companions) {
+		auto* bot = map_id2sd(aid);
+		if (!bot) continue;
+		auto* owner = map_charid2sd(bot->pop.companion_owner);
+		auto* md = owner ? map_getmapdata(owner->m) : nullptr;
+		if (!owner || !owner->status.party_id || bot->status.party_id != owner->status.party_id ||
+			!md || md->getMapFlag(MF_PVP) || map_flag_gvg2(owner->m) || md->getMapFlag(MF_BATTLEGROUND)) {
+			dismiss.push_back(bot); continue;
+		}
+		bot->pop.spawn_map_id = owner->m;
+		bot->pop.spawn_x = owner->x; bot->pop.spawn_y = owner->y;
+		if (pc_isdead(bot)) continue;
+		if (bot->m != owner->m || distance_bl(bot, owner) > 14) {
+			int16 x = owner->x, y = owner->y;
+			if (map_search_freecell(owner, owner->m, &x, &y, 3, 3, 0)) {
+				pc_setpos(bot, owner->mapindex, x, y, CLR_TELEPORT);
+				population_engine_shell_index_mark_dirty();
+				bot->pop.target_id = 0;
+			}
+		} else if (distance_bl(bot, owner) > 4 && !unit_is_walking(bot)) {
+			unit_walktobl(bot, owner, 2, 0);
+		}
+	}
+	for (auto* bot : dismiss) population_engine_remove_managed_shell(bot);
+	return 0;
+}
+
+void population_engine_restore_party(struct party* incoming) {
+	if (!incoming) return;
+	for (int32 aid : g_population_companions) {
+		auto* bot = map_id2sd(aid);
+		if (!bot || bot->status.party_id != incoming->party_id || !bot->pop.companion_owner) continue;
+		bool owner_present = false, already_present = false;
+		for (const auto& m : incoming->member) {
+			if (m.char_id == bot->pop.companion_owner) owner_present = true;
+			if (m.char_id == bot->status.char_id) already_present = true;
+		}
+		if (!owner_present || already_present) continue;
+		for (auto& m : incoming->member) {
+			if (m.account_id) continue;
+			m.account_id = bot->status.account_id; m.char_id = bot->status.char_id;
+			safestrncpy(m.name, bot->status.name, NAME_LENGTH);
+			safestrncpy(m.map, mapindex_id2name(bot->mapindex), sizeof(m.map));
+			m.class_ = bot->status.class_; m.lv = bot->status.base_level; m.online = 1;
+			++incoming->count;
+			break;
+		}
+	}
+}
+
+static map_session_data* population_engine_spawn_near(map_session_data* owner, uint16_t job_id, bool hangout) {
+	if (!owner || !g_population_engine_running || !pcdb_checkid(job_id) ||
+		g_population_engine_count.load() >= static_cast<size_t>(battle_config.population_engine_max_count)) return nullptr;
+	auto cfg = population_engine_db().find(job_id);
+	PopulationDbSource source = PopulationDbSource::Main;
+	if (!cfg) { cfg = population_pvp_db().find(job_id); source = PopulationDbSource::Pvp; }
+	if (!cfg) return nullptr;
+	auto pick = [](const auto& pool) -> uint16_t { return pool.empty() ? 0 : pool[rnd() % pool.size()]; };
+	int16 x = owner->x, y = owner->y;
+	if (!map_search_freecell(owner, owner->m, &x, &y, 3, 3, 0)) return nullptr;
+	uint32 index = population_engine_allocate_index();
+	if (!index) return nullptr;
+	auto* bot = population_engine_spawn_shell(owner->m, x, y, index, job_id, (get_job_required_sex(job_id) < 0 ? static_cast<char>(rnd() % 2) : get_job_required_sex(job_id)),
+		0, 0, pick(cfg->weapon_pool), pick(cfg->shield_pool), pick(cfg->head_top_pool),
+		pick(cfg->head_mid_pool), pick(cfg->head_bottom_pool), 0, 0, pick(cfg->garment_pool),
+		cfg->script, cfg->skip_arrow, cfg.get(), 0, source);
+	if (!bot) return nullptr;
+	bot->pop.profile_config = cfg;
+	bot->pop.behavior = bot->pop.behavior_base = static_cast<uint8>(hangout ? PopulationBehavior::Hangout : PopulationBehavior::Combat);
+	if (hangout) { population_engine_path_erase_for_pc(bot->id); pc_setsit(bot); clif_sitting(*bot); }
+	g_population_engine_pcs.push_back(bot);
+	++g_population_engine_count; ++g_population_engine_stats.active_units; ++g_population_engine_stats.total_created;
+	population_engine_shell_index_add(bot);
+	population_engine_combat_start_session(bot, PopulationCombatStartMode::AutoCombat, -1, SCSTART_NOAVOID);
+	return bot;
+}
+
+int population_engine_companion_recruit(map_session_data* owner, uint16_t job_id) {
+	if (!owner || !owner->status.party_id || map_getmapflag(owner->m, MF_PVP) || map_flag_gvg2(owner->m) || map_getmapflag(owner->m, MF_BATTLEGROUND)) return 0;
+	size_t count = 0;
+	for (auto* bot : g_population_engine_pcs) if (bot && bot->pop.companion_owner == owner->status.char_id) ++count;
+	if (count >= 4) return 0;
+	auto* bot = population_engine_spawn_near(owner, job_id, false);
+	if (!bot) return 0;
+	bot->status.party_id = 0;
+	if (!party_add_population_member(*owner, *bot)) { population_engine_remove_managed_shell(bot); return 0; }
+	bot->pop.companion_owner = owner->status.char_id;
+	population_engine_path_erase_for_pc(bot->id);
+	g_population_companions.insert(bot->id);
+	return 1;
+}
+
+int population_engine_companion_dismiss(map_session_data* owner) {
+	if (!owner) return 0;
+	std::vector<map_session_data*> dismiss;
+	for (auto* bot : g_population_engine_pcs) if (bot && bot->pop.companion_owner == owner->status.char_id) dismiss.push_back(bot);
+	for (auto* bot : dismiss) population_engine_remove_managed_shell(bot);
+	return static_cast<int>(dismiss.size());
+}
+
+int population_engine_hangout_spawn(map_session_data* owner, uint16_t job_id) {
+	return population_engine_spawn_near(owner, job_id, true) ? 1 : 0;
+}
+
 void do_init_population_engine() {
 	// Single-threaded engine: bot pathing uses unit_walktoxy / unit_walktobl.
+	add_timer_func_list(population_engine_companion_timer, "population_engine_companion_timer");
+	g_population_companion_timer = add_timer_interval(gettick() + 500, population_engine_companion_timer, 0, 0, 500);
 	add_timer_func_list(population_engine_autosummon_timer, "population_engine_autosummon_timer");
 	add_timer_func_list(population_engine_chat_timer, "population_engine_chat_timer");
 	add_timer_func_list(population_engine_global_combat_timer, "population_engine_global_combat_timer");
@@ -1494,107 +1689,11 @@ bool population_engine_reload_equipment(uint32_t *out_entry_count)
 	return ok;
 }
 
-static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, int y, uint32_t index,
-	uint16_t job_id, char sex, uint8_t hair_style, uint16_t hair_color,
-	uint16_t weapon, uint16_t shield, uint16_t head_top, uint16_t head_mid,
-	uint16_t head_bottom, uint32_t option, uint16_t cloth_color, uint16_t garment,
-	struct script_code* init_script, bool skip_arrow, const PopulationEngine* pop_cfg,
-	uint8_t map_category,
-	PopulationDbSource db_source)
+// Spawn phases execute synchronously on the map thread. Preserve their call order.
+struct PopulationShellVendorStockItem { t_itemid nameid; int16 amount; uint32_t price_override; };
+
+static void population_engine_initialize_shell_stats(map_session_data* sd, const PopulationEngine* pop_cfg)
 {
-	PE_PERF_SCOPE("spawn_shell");
-	if (map_id < 0) {
-		ShowError("Population engine: Invalid map_id %d\n", map_id);
-		return nullptr;
-	}
-	if (!map_getcell(map_id, x, y, CELL_CHKPASS)) {
-		ShowWarning("Population engine: Spawn position (%d,%d) on map %d is not walkable, skipping population shell %u\n",
-			x, y, map_id, index);
-		return nullptr;
-	}
-
-	uint8_t eff_hair = hair_style;
-	uint16_t eff_hair_color = hair_color;
-	uint16_t eff_cloth = cloth_color;
-	if (pop_cfg != nullptr) {
-		if (pop_cfg->hair_min >= 0) {
-			const int16_t hmax = pop_cfg->hair_max >= 0 ? pop_cfg->hair_max : pop_cfg->hair_min;
-			eff_hair = static_cast<uint8_t>(cap_value(population_roll_closed_range(pop_cfg->hair_min, hmax), MIN_HAIR_STYLE, MAX_HAIR_STYLE));
-		}
-		if (pop_cfg->hair_color_min >= 0) {
-			const int16_t hmax = pop_cfg->hair_color_max >= 0 ? pop_cfg->hair_color_max : pop_cfg->hair_color_min;
-			eff_hair_color = static_cast<uint16_t>(cap_value(population_roll_closed_range(pop_cfg->hair_color_min, hmax), MIN_HAIR_COLOR, MAX_HAIR_COLOR));
-		}
-		if (pop_cfg->cloth_color_min >= 0) {
-			const int16_t hmax = pop_cfg->cloth_color_max >= 0 ? pop_cfg->cloth_color_max : pop_cfg->cloth_color_min;
-			eff_cloth = static_cast<uint16_t>(cap_value(population_roll_closed_range(pop_cfg->cloth_color_min, hmax), MIN_CLOTH_COLOR, MAX_CLOTH_COLOR));
-		}
-	}
-
-	std::string name = generate_population_pc_name(index, pop_cfg);
-	const uint32_t account_id = POPULATION_ENGINE_ACCOUNT_ID_BASE + index;
-	const uint32_t char_id    = POPULATION_ENGINE_CHAR_ID_BASE    + index;
-
-	map_session_data* sd = nullptr;
-	CREATE(sd, map_session_data, 1);
-	new (sd) map_session_data();
-	// CREATE uses memset(0) which overrides C++ default member initializers.
-	// Explicitly set any fields whose sentinel value is NOT zero.
-	sd->pop.respawn_timer = INVALID_TIMER;
-
-	const t_tick tick = gettick();
-	pc_setnewpc(sd, account_id, char_id, 0, tick, (sex == 'M' ? SEX_MALE : SEX_FEMALE), 0);
-    
-	sd->group_id = 0;
-	pc_group_pc_load(sd);
-	if (!sd->group) {
-		ShowError("Population engine: no valid group (group_id=0) for population shell %u; using minimal defaults.\n", index);
-		sd->group = std::make_shared<s_player_group>();
-		sd->group->id    = 0;
-		sd->group->level = 0;
-		sd->group->log_commands = false;
-	}
-	if (sd->group->has_permission(PC_PERM_ALL_SKILL)) {
-		std::bitset<PC_PERM_MAX> perms = sd->permissions;
-		perms.reset(PC_PERM_ALL_SKILL);
-		sd->permissions = perms;
-	}
-    
-	memset(&sd->status, 0, sizeof(struct mmo_charstatus));
-	sd->status.char_id    = char_id;
-	sd->status.account_id = account_id;
-	sd->status.sex = (sex == 'M' ? SEX_MALE : SEX_FEMALE);
-	safestrncpy(sd->status.name, name.c_str(), sizeof(sd->status.name));
-
-	sd->status.class_ = job_id;
-	uint64 class_mapid = pc_jobid2mapid(job_id);
-	if (class_mapid == (uint64)-1 || !job_db.exists(job_id)) {
-		ShowError("Population engine: Invalid job %d for population shell %u; skipping spawn.\n", job_id, index);
-		population_engine_destroy_failed_spawn(sd);
-		return nullptr;
-	} else {
-		sd->class_ = class_mapid;
-		int32 verify_job = pc_mapid2jobid(class_mapid, (sex == 'M' ? 1 : 0));
-		if (verify_job != (int32)job_id && get_job_required_sex(job_id) != '\0') {
-			ShowWarning("Population engine: Job/MAPID mismatch for population shell %u: job_id=%d, mapid=%llu, sex=%c, verify_job=%d\n",
-				index, job_id, (unsigned long long)class_mapid, sex, verify_job);
-			sd->status.class_ = verify_job;
-		}
-	}
-
-	sd->status.hair         = cap_value(eff_hair, MIN_HAIR_STYLE, MAX_HAIR_STYLE);
-	sd->status.hair_color   = cap_value(eff_hair_color, MIN_HAIR_COLOR, MAX_HAIR_COLOR);
-	sd->status.clothes_color = cap_value(eff_cloth, MIN_CLOTH_COLOR, MAX_CLOTH_COLOR);
-	sd->status.body         = sd->status.class_;
-	// status.weapon is weapon_type enum, not an item id; pc_calcweapontype sets it after equip.
-	sd->status.weapon     = W_FIST;
-	sd->status.shield     = shield;
-	sd->status.head_top   = head_top;
-	sd->status.head_mid   = head_mid;
-	sd->status.head_bottom = head_bottom;
-	sd->status.robe       = garment;
-	sd->status.option     = option;
-
 	if (pop_cfg != nullptr && pop_cfg->base_level_min >= 0) {
 		const int16_t hi = pop_cfg->base_level_max >= 0 ? pop_cfg->base_level_max : pop_cfg->base_level_min;
 		sd->status.base_level = cap_value(population_roll_closed_range(pop_cfg->base_level_min, hi), 1, MAX_LEVEL);
@@ -1650,20 +1749,10 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 	sd->status.hp     = 1;
 	sd->status.max_sp = 1;
 	sd->status.sp     = 1;
+}
 
-	const char* mapname = map_mapid2mapname(map_id);
-	if (!mapname || !mapname[0]) {
-		ShowError("Population engine: Invalid map name for map_id %d\n", map_id);
-		population_engine_destroy_failed_spawn(sd);
-		return nullptr;
-	}
-	safestrncpy(sd->status.last_point.map, mapname, sizeof(sd->status.last_point.map));
-	sd->status.last_point.x = x;
-	sd->status.last_point.y = y;
-	safestrncpy(sd->status.save_point.map, mapname, sizeof(sd->status.save_point.map));
-	sd->status.save_point.x = x;
-	sd->status.save_point.y = y;
-
+static void population_engine_initialize_shell_runtime(map_session_data* sd, t_tick tick, const PopulationEngine* pop_cfg, uint8_t map_category)
+{
 	sd->state.connect_new = 1;
 	sd->followtimer             = INVALID_TIMER;
 	sd->invincible_timer        = INVALID_TIMER;
@@ -1760,18 +1849,22 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 	sd->vars_dirty  = false;
 	sd->vars_ok     = true;  // skip char-server auth
 	sd->vars_received = 0x7;
+}
 
+// On failure the unregistered shell is destroyed here; the caller must return immediately.
+static bool population_engine_place_shell(map_session_data* sd, const char* mapname, int x, int y, uint32_t index)
+{
 	uint16 mapindex = mapindex_name2id(mapname);
 	if (mapindex == 0) {
 		ShowError("Population engine: Invalid mapname %s (cannot convert to mapindex)\n", mapname);
 		population_engine_destroy_failed_spawn(sd);
-		return nullptr;
+		return false;
 	}
 	enum e_setpos setpos_result = pc_setpos(sd, mapindex, x, y, CLR_OUTSIGHT);
 	if (setpos_result != SETPOS_OK) {
 		ShowError("Population engine: Failed to set position for population shell %u (error %d)\n", index, setpos_result);
 		population_engine_destroy_failed_spawn(sd);
-		return nullptr;
+		return false;
 	}
 	// pc_setpos sets warp handshake flags; clear them so unit_remove_map doesn't warn on cleanup.
 	sd->state.changemap = 0;
@@ -1783,7 +1876,7 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 		ShowError("Population engine: Failed to add population shell %u to map\n", index);
 		map_deliddb(sd);
 		population_engine_destroy_failed_spawn(sd);
-		return nullptr;
+		return false;
 	}
 
 	// Skip clif_spawn — increment mapdata->users/users_pvp manually so unit_remove_map
@@ -1798,7 +1891,11 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 		}
 		sd->state.debug_remove_map = 0;
 	}
+	return true;
+}
 
+static void population_engine_initialize_shell_status(map_session_data* sd, uint16_t job_id, uint32_t index)
+{
 	// Fix sex mismatch for gender-locked jobs before status_calc_pc.
 	char required_sex_check = get_job_required_sex(sd->status.class_);
 	if (required_sex_check != '\0') {
@@ -1846,7 +1943,7 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 		const char cur_sex = get_job_required_sex(sd->status.class_);
 		const int32 req_int = (required_sex_check == 'M') ? 1 : 0;
 		if (cur_sex != required_sex_check || (sd->status.sex == SEX_MALE ? 1 : 0) != req_int
-		    || sd->status.class_ != job_id)
+			|| sd->status.class_ != job_id)
 		{
 			ShowWarning("Population engine: Fixing gender/job mismatch for population shell %u: original_job=%d (requires %c), current_job=%d (requires %c), current_sex=%c\n",
 				index, job_id, required_sex_check, sd->status.class_,
@@ -1877,7 +1974,10 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 	sd->battle_status.sp  = sd->base_status.max_sp;
 	if (sd->status.zeny < 100000)
 		sd->status.zeny = 100000;
-    
+}
+
+static void population_engine_grant_shell_skills(map_session_data* sd, const PopulationEngine* pop_cfg, uint32_t index)
+{
 	// Grant full job skill tree (YAML Skills: true, default) or minimal basics (Skills: false).
 	if (pop_cfg == nullptr || pop_cfg->grant_skill_tree) {
 		// pc_calc_skilltree sets prerequisites but doesn't assign levels; grant each skill explicitly
@@ -1930,7 +2030,10 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 	// take effect immediately. pc_equipitem below also triggers a recalc, but a shell
 	// with no equipment to wear would otherwise skip it and ship without passive stats.
 	status_calc_pc(sd, SCO_FORCE);
+}
 
+static void population_engine_equip_shell_weapon(map_session_data* sd, uint16_t weapon, uint32_t index)
+{
 	// max_weight must be raised before pc_additem: every pc_equipitem calls status_calc_pc
 	// which resets max_weight to job_base + str*300, causing subsequent pc_additem to fail
 	// with ADDITEM_OVERWEIGHT. The final status_calc_pc at the end restores the correct value.
@@ -1962,387 +2065,841 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 			ShowWarning("Population engine: Failed to add weapon %u to population shell %u inventory (result: %d)\n", weapon, index, result);
 		}
 	}
+}
 
-    // When a Script: block exists, setarrow/setbullet/setkunai in it run once via
-    // run_script at spawn.  Skip the built-in ammo pass to avoid double-equip.
-    if (!skip_arrow && init_script == nullptr && weapon > 0) {
-        struct item_data* wid = itemdb_search(weapon);
-        if (wid && wid->type == IT_WEAPON) {
-            t_itemid ammo_id = 0;
-            const char* ammo_ctx = nullptr;
-            switch (wid->subtype) {
-            case W_BOW:
-            case W_MUSICAL:
-            case W_WHIP:
-                ammo_id = find_arrow_ammo_item();
-                ammo_ctx = "arrow";
-                break;
-            case W_REVOLVER:
-            case W_RIFLE:
-            case W_GATLING:
-                ammo_id = find_ammo_item_by_subtype(AMMO_BULLET);
-                ammo_ctx = "bullet";
-                break;
-            case W_SHOTGUN:
-                ammo_id = find_ammo_item_by_subtype(AMMO_SHELL);
-                ammo_ctx = "shell";
-                break;
+static void population_engine_equip_shell_ammo(map_session_data* sd, uint16_t weapon, bool skip_arrow, script_code* init_script, uint32_t index)
+{
+	// When a Script: block exists, setarrow/setbullet/setkunai in it run once via
+	// run_script at spawn.  Skip the built-in ammo pass to avoid double-equip.
+	if (!skip_arrow && init_script == nullptr && weapon > 0) {
+		struct item_data* wid = itemdb_search(weapon);
+		if (wid && wid->type == IT_WEAPON) {
+			t_itemid ammo_id = 0;
+			const char* ammo_ctx = nullptr;
+			switch (wid->subtype) {
+			case W_BOW:
+			case W_MUSICAL:
+			case W_WHIP:
+				ammo_id = find_arrow_ammo_item();
+				ammo_ctx = "arrow";
+				break;
+			case W_REVOLVER:
+			case W_RIFLE:
+			case W_GATLING:
+				ammo_id = find_ammo_item_by_subtype(AMMO_BULLET);
+				ammo_ctx = "bullet";
+				break;
+			case W_SHOTGUN:
+				ammo_id = find_ammo_item_by_subtype(AMMO_SHELL);
+				ammo_ctx = "shell";
+				break;
 #ifdef RENEWAL
-            case W_GRENADE:
-                ammo_id = find_ammo_item_by_subtype(AMMO_GRENADE);
-                ammo_ctx = "grenade";
-                break;
+			case W_GRENADE:
+				ammo_id = find_ammo_item_by_subtype(AMMO_GRENADE);
+				ammo_ctx = "grenade";
+				break;
 #endif
-            case W_HUUMA:
-                ammo_id = find_ammo_item_by_subtype(AMMO_KUNAI);
-                ammo_ctx = "kunai";
-                break;
-            default:
-                break;
-            }
-            if (ammo_id != 0 && ammo_ctx != nullptr) {
-                struct item_data* aid = itemdb_search(ammo_id);
-                if (!aid || !aid->equip) {
-                    ShowWarning("Population engine: builtin %s ammo item %u invalid for population shell %u (weapon item %u)\n",
-                        ammo_ctx, (unsigned)ammo_id, index, (unsigned)weapon);
-                } else {
-                    // Cap amount to what fits by weight; always at least 1 so equip can proceed.
-                    int add_amount = 500;
-                    if (aid->weight > 0) {
-                        const int fits = (sd->max_weight - sd->weight) / static_cast<int>(aid->weight);
-                        add_amount = fits < 1 ? 1 : (fits < 500 ? fits : 500);
-                    }
-                    struct item tmp_item = {};
-                    tmp_item.nameid = ammo_id;
-                    tmp_item.amount = add_amount;
-                    tmp_item.identify = 1;
-                    tmp_item.equip = 0;
-                    enum e_additem_result ares = pc_additem(sd, &tmp_item, add_amount, LOG_TYPE_NONE, false);
-                    if (ares != ADDITEM_SUCCESS) {
-                        ShowWarning("Population engine: builtin %s pc_additem failed result=%d ammo=%u population shell %u (max_w=%d w=%d)\n",
-                            ammo_ctx, (int)ares, (unsigned)ammo_id, index, sd->max_weight, sd->weight);
-                    } else {
-                        bool done = false;
-                        for (int16 i = 0; i < MAX_INVENTORY; i++) {
-                            auto& aslot = sd->inventory.u.items_inventory[i];
-                            if (aslot.nameid == ammo_id && aslot.amount > 0 && aslot.equip == 0) {
-                                // Bypass pc_equipitem so that class-restricted ammo (Classes: All: false)
-                                // can be force-equipped on shells regardless of job. Shells are virtual
-                                // and never go through normal equip validation.
-                                aslot.equip = static_cast<unsigned int>(aid->equip);
-                                sd->equip_index[EQI_AMMO] = i;
-                                done = true;
-                                break;
-                            }
-                        }
-                        if (!done)
-                            ShowWarning("Population engine: builtin %s could not equip ammo %u after additem (population shell %u)\n",
-                                ammo_ctx, (unsigned)ammo_id, index);
-                    }
-                }
-            } else if (wid->subtype == W_BOW || wid->subtype == W_MUSICAL || wid->subtype == W_WHIP
-                || wid->subtype == W_REVOLVER || wid->subtype == W_RIFLE || wid->subtype == W_GATLING
-                || wid->subtype == W_SHOTGUN
+			case W_HUUMA:
+				ammo_id = find_ammo_item_by_subtype(AMMO_KUNAI);
+				ammo_ctx = "kunai";
+				break;
+			default:
+				break;
+			}
+			if (ammo_id != 0 && ammo_ctx != nullptr) {
+				struct item_data* aid = itemdb_search(ammo_id);
+				if (!aid || !aid->equip) {
+					ShowWarning("Population engine: builtin %s ammo item %u invalid for population shell %u (weapon item %u)\n",
+						ammo_ctx, (unsigned)ammo_id, index, (unsigned)weapon);
+				} else {
+					// Cap amount to what fits by weight; always at least 1 so equip can proceed.
+					int add_amount = 500;
+					if (aid->weight > 0) {
+						const int fits = (sd->max_weight - sd->weight) / static_cast<int>(aid->weight);
+						add_amount = fits < 1 ? 1 : (fits < 500 ? fits : 500);
+					}
+					struct item tmp_item = {};
+					tmp_item.nameid = ammo_id;
+					tmp_item.amount = add_amount;
+					tmp_item.identify = 1;
+					tmp_item.equip = 0;
+					enum e_additem_result ares = pc_additem(sd, &tmp_item, add_amount, LOG_TYPE_NONE, false);
+					if (ares != ADDITEM_SUCCESS) {
+						ShowWarning("Population engine: builtin %s pc_additem failed result=%d ammo=%u population shell %u (max_w=%d w=%d)\n",
+							ammo_ctx, (int)ares, (unsigned)ammo_id, index, sd->max_weight, sd->weight);
+					} else {
+						bool done = false;
+						for (int16 i = 0; i < MAX_INVENTORY; i++) {
+							auto& aslot = sd->inventory.u.items_inventory[i];
+							if (aslot.nameid == ammo_id && aslot.amount > 0 && aslot.equip == 0) {
+								// Bypass pc_equipitem so that class-restricted ammo (Classes: All: false)
+								// can be force-equipped on shells regardless of job. Shells are virtual
+								// and never go through normal equip validation.
+								aslot.equip = static_cast<unsigned int>(aid->equip);
+								sd->equip_index[EQI_AMMO] = i;
+								done = true;
+								break;
+							}
+						}
+						if (!done)
+							ShowWarning("Population engine: builtin %s could not equip ammo %u after additem (population shell %u)\n",
+								ammo_ctx, (unsigned)ammo_id, index);
+					}
+				}
+			} else if (wid->subtype == W_BOW || wid->subtype == W_MUSICAL || wid->subtype == W_WHIP
+				|| wid->subtype == W_REVOLVER || wid->subtype == W_RIFLE || wid->subtype == W_GATLING
+				|| wid->subtype == W_SHOTGUN
 #ifdef RENEWAL
-                || wid->subtype == W_GRENADE
+				|| wid->subtype == W_GRENADE
 #endif
-                || wid->subtype == W_HUUMA) {
-                ShowWarning("Population engine: no item_db ammo for weapon subtype %u (item %u) population shell %u\n",
-                    (unsigned)wid->subtype, (unsigned)weapon, index);
-            }
-        }
-    }
-    
-    if (shield > 0) {
-        struct item tmp_item = {};
-        tmp_item.nameid = shield;
-        tmp_item.amount = 1;
-        tmp_item.identify = 1;
-        tmp_item.equip = 0;
-        enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
-        if (result == ADDITEM_SUCCESS) {
-            for (int16 i = 0; i < MAX_INVENTORY; i++) {
-                if (sd->inventory.u.items_inventory[i].nameid == shield && sd->inventory.u.items_inventory[i].amount > 0
-                    && sd->inventory.u.items_inventory[i].equip == 0) {
-                    struct item_data* id = itemdb_search(shield);
-                    if (id && id->equip) {
-                        bool equip_result = pc_equipitem(sd, i, id->equip, false);
-                        if (equip_result) {
-                            // Update view_data manually for population shells
-                            sd->vd.look[LOOK_SHIELD] = shield;
-                            sd->status.shield = shield;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    
-    if (head_top > 0) {
-        struct item tmp_item = {};
-        tmp_item.nameid = head_top;
-        tmp_item.amount = 1;
-        tmp_item.identify = 1;
-        tmp_item.equip = 0;
-        enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
-        if (result == ADDITEM_SUCCESS) {
-            for (int16 i = 0; i < MAX_INVENTORY; i++) {
-                if (sd->inventory.u.items_inventory[i].nameid == head_top && sd->inventory.u.items_inventory[i].amount > 0
-                    && sd->inventory.u.items_inventory[i].equip == 0) {
-                    struct item_data* id = itemdb_search(head_top);
-                    if (id && id->equip) {
-                        bool equip_result = pc_equipitem(sd, i, id->equip, false);
-                        if (equip_result) {
-                            sd->vd.look[LOOK_HEAD_TOP] = head_top;
-                            sd->status.head_top = head_top;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
+				|| wid->subtype == W_HUUMA) {
+				ShowWarning("Population engine: no item_db ammo for weapon subtype %u (item %u) population shell %u\n",
+					(unsigned)wid->subtype, (unsigned)weapon, index);
+			}
+		}
+	}
+}
 
-    if (head_mid > 0) {
-        struct item tmp_item = {};
-        tmp_item.nameid = head_mid;
-        tmp_item.amount = 1;
-        tmp_item.identify = 1;
-        tmp_item.equip = 0;
-        enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
-        if (result == ADDITEM_SUCCESS) {
-            for (int16 i = 0; i < MAX_INVENTORY; i++) {
-                if (sd->inventory.u.items_inventory[i].nameid == head_mid && sd->inventory.u.items_inventory[i].amount > 0
-                    && sd->inventory.u.items_inventory[i].equip == 0) {
-                    struct item_data* id = itemdb_search(head_mid);
-                    if (id && id->equip) {
-                        bool equip_result = pc_equipitem(sd, i, id->equip, false);
-                        if (equip_result) {
-                            sd->vd.look[LOOK_HEAD_MID] = head_mid;
-                            sd->status.head_mid = head_mid;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
+static void population_engine_equip_shell_armor(map_session_data* sd, uint16_t shield, uint16_t head_top, uint16_t head_mid, uint16_t head_bottom, uint16_t garment)
+{
+	if (shield > 0) {
+		struct item tmp_item = {};
+		tmp_item.nameid = shield;
+		tmp_item.amount = 1;
+		tmp_item.identify = 1;
+		tmp_item.equip = 0;
+		enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
+		if (result == ADDITEM_SUCCESS) {
+			for (int16 i = 0; i < MAX_INVENTORY; i++) {
+				if (sd->inventory.u.items_inventory[i].nameid == shield && sd->inventory.u.items_inventory[i].amount > 0
+					&& sd->inventory.u.items_inventory[i].equip == 0) {
+					struct item_data* id = itemdb_search(shield);
+					if (id && id->equip) {
+						bool equip_result = pc_equipitem(sd, i, id->equip, false);
+						if (equip_result) {
+							// Update view_data manually for population shells
+							sd->vd.look[LOOK_SHIELD] = shield;
+							sd->status.shield = shield;
+						}
+						break;
+					}
+				}
+			}
+		}
+	}
 
-    if (head_bottom > 0) {
-        struct item tmp_item = {};
-        tmp_item.nameid = head_bottom;
-        tmp_item.amount = 1;
-        tmp_item.identify = 1;
-        tmp_item.equip = 0;
-        enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
-        if (result == ADDITEM_SUCCESS) {
-            for (int16 i = 0; i < MAX_INVENTORY; i++) {
-                if (sd->inventory.u.items_inventory[i].nameid == head_bottom && sd->inventory.u.items_inventory[i].amount > 0
-                    && sd->inventory.u.items_inventory[i].equip == 0) {
-                    struct item_data* id = itemdb_search(head_bottom);
-                    if (id && id->equip) {
-                        bool equip_result = pc_equipitem(sd, i, id->equip, false);
-                        if (equip_result) {
-                            sd->vd.look[LOOK_HEAD_BOTTOM] = head_bottom;
-                            sd->status.head_bottom = head_bottom;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
+	if (head_top > 0) {
+		struct item tmp_item = {};
+		tmp_item.nameid = head_top;
+		tmp_item.amount = 1;
+		tmp_item.identify = 1;
+		tmp_item.equip = 0;
+		enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
+		if (result == ADDITEM_SUCCESS) {
+			for (int16 i = 0; i < MAX_INVENTORY; i++) {
+				if (sd->inventory.u.items_inventory[i].nameid == head_top && sd->inventory.u.items_inventory[i].amount > 0
+					&& sd->inventory.u.items_inventory[i].equip == 0) {
+					struct item_data* id = itemdb_search(head_top);
+					if (id && id->equip) {
+						bool equip_result = pc_equipitem(sd, i, id->equip, false);
+						if (equip_result) {
+							sd->vd.look[LOOK_HEAD_TOP] = head_top;
+							sd->status.head_top = head_top;
+						}
+						break;
+					}
+				}
+			}
+		}
+	}
 
-    if (garment > 0) {
-        struct item tmp_item = {};
-        tmp_item.nameid = garment;
-        tmp_item.amount = 1;
-        tmp_item.identify = 1;
-        tmp_item.equip = 0;
-        enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
-        if (result == ADDITEM_SUCCESS) {
-            for (int16 i = 0; i < MAX_INVENTORY; i++) {
-                if (sd->inventory.u.items_inventory[i].nameid == garment && sd->inventory.u.items_inventory[i].amount > 0
-                    && sd->inventory.u.items_inventory[i].equip == 0) {
-                    struct item_data* id = itemdb_search(garment);
-                    if (id && id->equip) {
-                        bool equip_result = pc_equipitem(sd, i, id->equip, false);
-                        if (equip_result) {
-                            sd->vd.look[LOOK_ROBE] = garment;
-                            sd->status.robe = garment;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
+	if (head_mid > 0) {
+		struct item tmp_item = {};
+		tmp_item.nameid = head_mid;
+		tmp_item.amount = 1;
+		tmp_item.identify = 1;
+		tmp_item.equip = 0;
+		enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
+		if (result == ADDITEM_SUCCESS) {
+			for (int16 i = 0; i < MAX_INVENTORY; i++) {
+				if (sd->inventory.u.items_inventory[i].nameid == head_mid && sd->inventory.u.items_inventory[i].amount > 0
+					&& sd->inventory.u.items_inventory[i].equip == 0) {
+					struct item_data* id = itemdb_search(head_mid);
+					if (id && id->equip) {
+						bool equip_result = pc_equipitem(sd, i, id->equip, false);
+						if (equip_result) {
+							sd->vd.look[LOOK_HEAD_MID] = head_mid;
+							sd->status.head_mid = head_mid;
+						}
+						break;
+					}
+				}
+			}
+		}
+	}
 
-    if (pop_cfg != nullptr) {
-        auto pick_pool_cfg = [](const std::vector<uint16_t>& p) -> uint16_t {
-            if (p.empty()) return 0;
-            return p.size() == 1 ? p[0] : p[rnd() % p.size()];
-        };
-        population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->armor_pool),   index, "armor");
-        population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->shoes_pool),   index, "shoes");
-        population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->acc_l_pool),   index, "acc_l", EQP_ACC_L);
-        population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->acc_r_pool),   index, "acc_r", EQP_ACC_R);
-    }
+	if (head_bottom > 0) {
+		struct item tmp_item = {};
+		tmp_item.nameid = head_bottom;
+		tmp_item.amount = 1;
+		tmp_item.identify = 1;
+		tmp_item.equip = 0;
+		enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
+		if (result == ADDITEM_SUCCESS) {
+			for (int16 i = 0; i < MAX_INVENTORY; i++) {
+				if (sd->inventory.u.items_inventory[i].nameid == head_bottom && sd->inventory.u.items_inventory[i].amount > 0
+					&& sd->inventory.u.items_inventory[i].equip == 0) {
+					struct item_data* id = itemdb_search(head_bottom);
+					if (id && id->equip) {
+						bool equip_result = pc_equipitem(sd, i, id->equip, false);
+						if (equip_result) {
+							sd->vd.look[LOOK_HEAD_BOTTOM] = head_bottom;
+							sd->status.head_bottom = head_bottom;
+						}
+						break;
+					}
+				}
+			}
+		}
+	}
 
-    // Stock consumable trap items for jobs that use trap skills.
-    // Hunter/Sniper use Booby_Trap (1065); Ranger uses Special_Alloy_Trap (7940);
-    // Genetic uses Seed_Of_Horny_Plant (6210).  Amount is generous to avoid running out.
-    {
-        struct { t_itemid nameid; int amount; } trap_stock[3] = {};
-        int trap_count = 0;
-        const bool is_hunter_line = (job_id == JOB_HUNTER || job_id == JOB_SNIPER
-            || job_id == JOB_RANGER || job_id == JOB_RANGER_T);
-        const bool is_ranger = (job_id == JOB_RANGER || job_id == JOB_RANGER_T);
-        const bool is_genetic = (job_id == JOB_GENETIC || job_id == JOB_GENETIC_T);
-        if (is_hunter_line) {
-            trap_stock[trap_count++] = { 1065, 500 };  // Booby_Trap
-        }
-        if (is_ranger) {
-            trap_stock[trap_count++] = { 7940, 500 };  // Special_Alloy_Trap
-        }
-        if (is_genetic) {
-            trap_stock[trap_count++] = { 6210, 500 };  // Seed_Of_Horny_Plant
-        }
-        for (int ti = 0; ti < trap_count; ti++) {
-            struct item tmp_item = {};
-            tmp_item.nameid   = trap_stock[ti].nameid;
-            tmp_item.amount   = 1;
-            tmp_item.identify = 1;
-            tmp_item.equip    = 0;
-            pc_additem(sd, &tmp_item, trap_stock[ti].amount, LOG_TYPE_NONE, false);
-        }
-    }
+	if (garment > 0) {
+		struct item tmp_item = {};
+		tmp_item.nameid = garment;
+		tmp_item.amount = 1;
+		tmp_item.identify = 1;
+		tmp_item.equip = 0;
+		enum e_additem_result result = pc_additem(sd, &tmp_item, 1, LOG_TYPE_NONE, false);
+		if (result == ADDITEM_SUCCESS) {
+			for (int16 i = 0; i < MAX_INVENTORY; i++) {
+				if (sd->inventory.u.items_inventory[i].nameid == garment && sd->inventory.u.items_inventory[i].amount > 0
+					&& sd->inventory.u.items_inventory[i].equip == 0) {
+					struct item_data* id = itemdb_search(garment);
+					if (id && id->equip) {
+						bool equip_result = pc_equipitem(sd, i, id->equip, false);
+						if (equip_result) {
+							sd->vd.look[LOOK_ROBE] = garment;
+							sd->status.robe = garment;
+						}
+						break;
+					}
+				}
+			}
+		}
+	}
+}
 
-    // Mark as active before run_script / status_calc_pc so script commands that
-    // check sd->state.active (e.g. setriding, setarrow) execute correctly.
-    sd->base_status.mode = static_cast<e_mode>(MD_CANMOVE | MD_CANATTACK);
-    sd->state.active = 1;
-    sd->state.pc_loaded = true;
+static void population_engine_stock_shell_supplies(map_session_data* sd, const PopulationEngine* pop_cfg, uint16_t job_id, uint32_t index)
+{
+	if (pop_cfg != nullptr) {
+		auto pick_pool_cfg = [](const std::vector<uint16_t>& p) -> uint16_t {
+			if (p.empty()) return 0;
+			return p.size() == 1 ? p[0] : p[rnd() % p.size()];
+		};
+		population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->armor_pool),   index, "armor");
+		population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->shoes_pool),   index, "shoes");
+		population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->acc_l_pool),   index, "acc_l", EQP_ACC_L);
+		population_engine_shell_equip_item(sd, pick_pool_cfg(pop_cfg->acc_r_pool),   index, "acc_r", EQP_ACC_R);
+	}
 
-    // Raise carry limit before status_calc_pc so setriding / setarrow do not fail.
-    if (sd->max_weight <= 0 || sd->max_weight < 10000)
-        sd->max_weight = 8000 + (sd->status.str * 300);
+	// Stock consumable trap items for jobs that use trap skills.
+	// Hunter/Sniper use Booby_Trap (1065); Ranger uses Special_Alloy_Trap (7940);
+	// Genetic uses Seed_Of_Horny_Plant (6210).  Amount is generous to avoid running out.
+	{
+		struct { t_itemid nameid; int amount; } trap_stock[3] = {};
+		int trap_count = 0;
+		const bool is_hunter_line = (job_id == JOB_HUNTER || job_id == JOB_SNIPER
+			|| job_id == JOB_RANGER || job_id == JOB_RANGER_T);
+		const bool is_ranger = (job_id == JOB_RANGER || job_id == JOB_RANGER_T);
+		const bool is_genetic = (job_id == JOB_GENETIC || job_id == JOB_GENETIC_T);
+		if (is_hunter_line) {
+			trap_stock[trap_count++] = { 1065, 500 };  // Booby_Trap
+		}
+		if (is_ranger) {
+			trap_stock[trap_count++] = { 7940, 500 };  // Special_Alloy_Trap
+		}
+		if (is_genetic) {
+			trap_stock[trap_count++] = { 6210, 500 };  // Seed_Of_Horny_Plant
+		}
+		for (int ti = 0; ti < trap_count; ti++) {
+			struct item tmp_item = {};
+			tmp_item.nameid   = trap_stock[ti].nameid;
+			tmp_item.amount   = 1;
+			tmp_item.identify = 1;
+			tmp_item.equip    = 0;
+			pc_additem(sd, &tmp_item, trap_stock[ti].amount, LOG_TYPE_NONE, false);
+		}
+	}
+}
 
-    // Run the full Script: once to execute side-effect commands (setriding, setfalcon, etc.).
-    if (init_script != nullptr)
-        run_script(init_script, 0, sd->id, fake_nd->id);
+static void population_engine_apply_shell_scripts(map_session_data* sd, script_code* init_script, const PopulationEngine* pop_cfg)
+{
+	// Mark as active before run_script / status_calc_pc so script commands that
+	// check sd->state.active (e.g. setriding, setarrow) execute correctly.
+	sd->base_status.mode = static_cast<e_mode>(MD_CANMOVE | MD_CANATTACK);
+	sd->state.active = 1;
+	sd->state.pc_loaded = true;
 
-    // Register the filtered Script: (side-effect commands stripped) as a persistent
-    // bonus_script so bonus commands survive every future status_calc_pc call.
-    if (pop_cfg != nullptr && !pop_cfg->bonus_script_str.empty()) {
-        struct s_bonus_script_entry* bse = pc_bonus_script_add(
-            sd,
-            pop_cfg->bonus_script_str.c_str(),
-            static_cast<t_tick>(86400000LL) * 365 * 10,  // ~10-year "permanent" duration
-            EFST_BLANK,
-            BSF_PERMANENT,
-            0);
-        if (bse != nullptr)
-            linkdb_insert(&sd->bonus_script.head, (void*)((intptr_t)bse), bse);
-    }
+	// Raise carry limit before status_calc_pc so setriding / setarrow do not fail.
+	if (sd->max_weight <= 0 || sd->max_weight < 10000)
+		sd->max_weight = 8000 + (sd->status.str * 300);
 
-    // Single status_calc_pc: rebuilds item bonuses and re-runs all bonus_script entries.
-    status_calc_pc(sd, SCO_NONE);
+	// Run the full Script: once to execute side-effect commands (setriding, setfalcon, etc.).
+	if (init_script != nullptr)
+		run_script(init_script, 0, sd->id, fake_nd->id);
 
-    // Restore full SP after recalc (base SP formula for shells is often 0).
-    if (sd->battle_status.max_sp > 0) {
-        sd->status.sp = sd->battle_status.max_sp;
-        sd->battle_status.sp = sd->battle_status.max_sp;
-    }
+	// Register the filtered Script: (side-effect commands stripped) as a persistent
+	// bonus_script so bonus commands survive every future status_calc_pc call.
+	if (pop_cfg != nullptr && !pop_cfg->bonus_script_str.empty()) {
+		struct s_bonus_script_entry* bse = pc_bonus_script_add(
+			sd,
+			pop_cfg->bonus_script_str.c_str(),
+			static_cast<t_tick>(86400000LL) * 365 * 10,  // ~10-year "permanent" duration
+			EFST_BLANK,
+			BSF_PERMANENT,
+			0);
+		if (bse != nullptr)
+			linkdb_insert(&sd->bonus_script.head, (void*)((intptr_t)bse), bse);
+	}
 
-    // Re-check carry limit after recalc in case it was overwritten.
-    if (sd->max_weight <= 0 || sd->max_weight < 10000)
-        sd->max_weight = 8000 + (sd->status.str * 300);
-    population_engine_sync_vd_weapon_shield(sd);
-    sd->vd.look[LOOK_HEAD_TOP] = sd->status.head_top;
-    sd->vd.look[LOOK_HEAD_MID] = sd->status.head_mid;
-    sd->vd.look[LOOK_HEAD_BOTTOM] = sd->status.head_bottom;
-    sd->vd.look[LOOK_ROBE] = sd->status.robe;
+	// Single status_calc_pc: rebuilds item bonuses and re-runs all bonus_script entries.
+	status_calc_pc(sd, SCO_NONE);
 
-    // Elysium stress_test fake PCs: sync paper doll to the map before spawn so observers match stock AC shells.
-    clif_changelook(sd, LOOK_BASE, sd->vd.look[LOOK_BASE]);
-    clif_changelook(sd, LOOK_HAIR, sd->vd.look[LOOK_HAIR]);
-    clif_changelook(sd, LOOK_HAIR_COLOR, sd->vd.look[LOOK_HAIR_COLOR]);
-    clif_changelook(sd, LOOK_CLOTHES_COLOR, sd->vd.look[LOOK_CLOTHES_COLOR]);
-    clif_changelook(sd, LOOK_WEAPON, sd->vd.look[LOOK_WEAPON]);
-    clif_changelook(sd, LOOK_SHIELD, sd->vd.look[LOOK_SHIELD]);
-    clif_changelook(sd, LOOK_HEAD_TOP, sd->vd.look[LOOK_HEAD_TOP]);
-    clif_changelook(sd, LOOK_HEAD_MID, sd->vd.look[LOOK_HEAD_MID]);
-    clif_changelook(sd, LOOK_HEAD_BOTTOM, sd->vd.look[LOOK_HEAD_BOTTOM]);
-    clif_changelook(sd, LOOK_ROBE, sd->vd.look[LOOK_ROBE]);
-    clif_changeoption(sd);
+	// Restore full SP after recalc (base SP formula for shells is often 0).
+	if (sd->battle_status.max_sp > 0) {
+		sd->status.sp = sd->battle_status.max_sp;
+		sd->battle_status.sp = sd->battle_status.max_sp;
+	}
 
-    if (!population_engine_combat_try_start(sd)) {
-        population_engine_shell_release(sd);
-        return nullptr;
-    }
+	// Re-check carry limit after recalc in case it was overwritten.
+	if (sd->max_weight <= 0 || sd->max_weight < 10000)
+		sd->max_weight = 8000 + (sd->status.str * 300);
+}
 
-    clif_spawn(sd);
+static void population_engine_publish_shell_appearance(map_session_data* sd)
+{
+	population_engine_sync_vd_weapon_shield(sd);
+	sd->vd.look[LOOK_HEAD_TOP] = sd->status.head_top;
+	sd->vd.look[LOOK_HEAD_MID] = sd->status.head_mid;
+	sd->vd.look[LOOK_HEAD_BOTTOM] = sd->status.head_bottom;
+	sd->vd.look[LOOK_ROBE] = sd->status.robe;
 
-    // Store map category, spawn position, and resolved behavior for the combat tick.
-    sd->pop.map_category = map_category;
-    sd->pop.spawn_x      = static_cast<int16_t>(x);
-    sd->pop.spawn_y      = static_cast<int16_t>(y);
-    sd->pop.spawn_map_id = map_id;
+	// Elysium stress_test fake PCs: sync paper doll to the map before spawn so observers match stock AC shells.
+	clif_changelook(sd, LOOK_BASE, sd->vd.look[LOOK_BASE]);
+	clif_changelook(sd, LOOK_HAIR, sd->vd.look[LOOK_HAIR]);
+	clif_changelook(sd, LOOK_HAIR_COLOR, sd->vd.look[LOOK_HAIR_COLOR]);
+	clif_changelook(sd, LOOK_CLOTHES_COLOR, sd->vd.look[LOOK_CLOTHES_COLOR]);
+	clif_changelook(sd, LOOK_WEAPON, sd->vd.look[LOOK_WEAPON]);
+	clif_changelook(sd, LOOK_SHIELD, sd->vd.look[LOOK_SHIELD]);
+	clif_changelook(sd, LOOK_HEAD_TOP, sd->vd.look[LOOK_HEAD_TOP]);
+	clif_changelook(sd, LOOK_HEAD_MID, sd->vd.look[LOOK_HEAD_MID]);
+	clif_changelook(sd, LOOK_HEAD_BOTTOM, sd->vd.look[LOOK_HEAD_BOTTOM]);
+	clif_changelook(sd, LOOK_ROBE, sd->vd.look[LOOK_ROBE]);
+	clif_changeoption(sd);
+}
 
-    // Resolve effective behavior: per-category override wins over the profile default.
-    PopulationBehavior pe_beh = (pop_cfg != nullptr) ? pop_cfg->behavior : PopulationBehavior::Combat;
-    if (pop_cfg != nullptr) {
-        PopulationBehavior override_beh = PopulationBehavior::None;
-        if (map_category == 1) override_beh = pop_cfg->town_behavior;
-        else if (map_category == 2) override_beh = pop_cfg->field_behavior;
-        else if (map_category == 3) override_beh = pop_cfg->dungeon_behavior;
-        if (override_beh != PopulationBehavior::None)
-            pe_beh = override_beh;
-    }
+static PopulationBehavior population_engine_start_shell_behavior(map_session_data* sd, int16_t map_id, int x, int y, uint8_t map_category, PopulationDbSource db_source, const PopulationEngine* pop_cfg)
+{
+	// Store map category, spawn position, and resolved behavior for the combat tick.
+	sd->pop.map_category = map_category;
+	sd->pop.spawn_x      = static_cast<int16_t>(x);
+	sd->pop.spawn_y      = static_cast<int16_t>(y);
+	sd->pop.spawn_map_id = map_id;
 
-    sd->pop.behavior = static_cast<uint8_t>(pe_beh);
-    sd->pop.behavior_base = static_cast<uint8_t>(pe_beh);
-    sd->pop.flags    = ((pop_cfg != nullptr) ? pop_cfg->flags : 0u) | PSF::CombatActive;
-    sd->pop.role     = (pop_cfg != nullptr) ? static_cast<int8_t>(pop_cfg->role_type) : 0;
-    sd->pop.db_source = static_cast<uint8_t>(db_source);
-    sd->pop.arena_team = 0; // not in arena by default
-    // Assign a per-map fake party ID so shells on the same map are treated as
-    // party members by battle_check_target(BCT_PARTY).  This lets party-only
-    // skills (CR_DEVOTION, PR_KYRIE on allies, etc.) cast between shells without
-    // creating real party structs.  The ID is in the 0x70000000 range — far above
-    // any char-server-allocated party ID — and is never saved or sent to a client.
-    sd->status.party_id = static_cast<int32>(0x70000000u | static_cast<uint32>(static_cast<uint16>(sd->m)));
+	// Resolve effective behavior: per-category override wins over the profile default.
+	PopulationBehavior pe_beh = (pop_cfg != nullptr) ? pop_cfg->behavior : PopulationBehavior::Combat;
+	if (pop_cfg != nullptr) {
+		PopulationBehavior override_beh = PopulationBehavior::None;
+		if (map_category == 1) override_beh = pop_cfg->town_behavior;
+		else if (map_category == 2) override_beh = pop_cfg->field_behavior;
+		else if (map_category == 3) override_beh = pop_cfg->dungeon_behavior;
+		if (override_beh != PopulationBehavior::None)
+			pe_beh = override_beh;
+	}
 
-    if (pe_beh == PopulationBehavior::Combat || pe_beh == PopulationBehavior::Guard) {
-        const PopulationCombatStartResult ac = population_engine_combat_start_session(sd, PopulationCombatStartMode::AutoCombat, -1, SCSTART_NOAVOID | SCSTART_LOADED);
-        if (!ac.started) {
-            ShowWarning("Population engine: population combat replica did not start for shell '%s' (reject=%s); bot will wander/chat only. "
-                "With Behavior: combat/guard, skills and targeting come from db/autocombat_config.yml (not db/population_engine.yml).\n",
-                sd->status.name, population_combat_reject_code_name(ac.reject_code));
-        }
-    }
+	sd->pop.behavior = static_cast<uint8_t>(pe_beh);
+	sd->pop.behavior_base = static_cast<uint8_t>(pe_beh);
+	sd->pop.flags    = ((pop_cfg != nullptr) ? pop_cfg->flags : 0u) | PSF::CombatActive;
+	sd->pop.role     = (pop_cfg != nullptr) ? static_cast<int8_t>(pop_cfg->role_type) : 0;
+	sd->pop.db_source = static_cast<uint8_t>(db_source);
+	sd->pop.arena_team = 0; // not in arena by default
+	// Assign a per-map fake party ID so shells on the same map are treated as
+	// party members by battle_check_target(BCT_PARTY).  This lets party-only
+	// skills (CR_DEVOTION, PR_KYRIE on allies, etc.) cast between shells without
+	// creating real party structs.  The ID is in the 0x70000000 range — far above
+	// any char-server-allocated party ID — and is never saved or sent to a client.
+	sd->status.party_id = static_cast<int32>(0x70000000u | static_cast<uint32>(static_cast<uint16>(sd->m)));
 
-    // Send equipment list to own client only (fake PCs usually have fd<=0).
-    if (sd->fd > 0) {
-        clif_equiplist(sd);
-    }
+	if (pe_beh == PopulationBehavior::Combat || pe_beh == PopulationBehavior::Guard || pe_beh == PopulationBehavior::Hangout) {
+		const PopulationCombatStartResult ac = population_engine_combat_start_session(sd, PopulationCombatStartMode::AutoCombat, -1, SCSTART_NOAVOID | SCSTART_LOADED);
+		if (!ac.started) {
+			ShowWarning("Population engine: population combat replica did not start for shell '%s' (reject=%s); bot will wander/chat only. "
+				"Skills and targeting use db/population_skill_db.yml and the job skill tree.\n",
+				sd->status.name, population_combat_reject_code_name(ac.reject_code));
+		}
+	}
 
-    // Clear act/move locks so autocombat + wander timers can run immediately after spawn.
-    sd->ud.canact_tick = 0;
-    sd->ud.canmove_tick = 0;
-    sd->ud.skilltimer = INVALID_TIMER;
+	// Send equipment list to own client only (fake PCs usually have fd<=0).
+	if (sd->fd > 0) {
+		clif_equiplist(sd);
+	}
+
+	// Clear act/move locks so autocombat + wander timers can run immediately after spawn.
+	sd->ud.canact_tick = 0;
+	sd->ud.canmove_tick = 0;
+	sd->ud.skilltimer = INVALID_TIMER;
 
 	population_engine_register_shell_chat_state(sd, pop_cfg);
 	if (pe_beh == PopulationBehavior::Combat    ||
-	    pe_beh == PopulationBehavior::Wander    ||
-	    pe_beh == PopulationBehavior::Support   ||
-	    pe_beh == PopulationBehavior::Social)
+		pe_beh == PopulationBehavior::Wander    ||
+		pe_beh == PopulationBehavior::Support   ||
+		pe_beh == PopulationBehavior::Social)
 		population_engine_register_shell_wander_state(sd);
+	return pe_beh;
+}
+
+static std::vector<int16> population_engine_vendor_source_maps(map_session_data* sd, const PopulationVendorEntry* vendor_cfg)
+{
+	std::vector<int16> source_mids;
+	{
+		std::lock_guard<std::mutex> lock(g_pop_vendor_dyn_cache_mutex);
+		PopVendorCacheBucket &bucket = g_pop_vendor_dyn_cache[vendor_cfg->key];
+		if (!bucket.source_mids_built) {
+			if (!vendor_cfg->source_maps.empty()) {
+				for (const std::string& mn : vendor_cfg->source_maps) {
+					const int16 mid = map_mapname2mapid(mn.c_str());
+					if (mid >= 0) bucket.source_mids.push_back(mid);
+				}
+			} else if (!vendor_cfg->source_category.empty()) {
+				const bool want_dungeons = (vendor_cfg->source_category == "dungeon" || vendor_cfg->source_category == "both");
+				const bool want_fields   = (vendor_cfg->source_category == "field"   || vendor_cfg->source_category == "both");
+				std::unordered_set<int16> seen_mids;
+				for (auto sit = population_spawn_db().begin(); sit != population_spawn_db().end(); ++sit) {
+					if (!sit->second) continue;
+					const PopulationSpawnEntry &se = *sit->second;
+					auto add = [&](const std::vector<std::string> &maps) {
+						for (const std::string &mn : maps) {
+							const int16 mid = map_mapname2mapid(mn.c_str());
+							if (mid >= 0 && seen_mids.insert(mid).second)
+								bucket.source_mids.push_back(mid);
+						}
+					};
+					if (want_dungeons) add(se.dungeons);
+					if (want_fields)   add(se.fields);
+				}
+			} else {
+				bucket.source_mids.push_back(sd->m); // legacy: spawn map only
+			}
+			bucket.source_mids_built = true;
+		}
+		source_mids = bucket.source_mids; // copy out; release lock below
+	}
+	return source_mids;
+}
+
+static const std::vector<PopVendorDropEntry>& population_engine_vendor_drop_pool(const PopulationVendorEntry* vendor_cfg, int16 src_mid)
+{
+	std::lock_guard<std::mutex> lock(g_pop_vendor_dyn_cache_mutex);
+	PopVendorCacheBucket &bucket = g_pop_vendor_dyn_cache[vendor_cfg->key];
+	auto it = bucket.drops_by_mid.find(src_mid);
+	if (it != bucket.drops_by_mid.end()) return it->second;
+	std::vector<PopVendorDropEntry> built;
+	struct map_data *src_map = map_getmapdata(src_mid);
+	if (src_map) {
+		std::unordered_map<t_itemid, uint32_t> local_seen;
+		for (int i = 0; i < MAX_MOB_LIST_PER_MAP; ++i) {
+			if (!src_map->moblist[i]) continue;
+			const int16 mob_id = src_map->moblist[i]->id;
+			if (mob_id <= 0) continue;
+			auto mdb = mob_db.find(static_cast<uint32>(mob_id));
+			if (!mdb) continue;
+			for (const auto &drop : mdb->dropitem) {
+				if (!drop || drop->nameid == 0) continue;
+				auto idata = item_db.find(drop->nameid);
+				if (!idata) continue;
+				// Apply ItemFlags filters at cache time (filters are part of the vendor key).
+				const bool is_equip = (idata->equip != 0);
+				if (is_equip && !vendor_cfg->allow_equipment) continue;
+				if (idata->type == IT_CARD       && !vendor_cfg->allow_cards)  continue;
+				if (idata->type == IT_ETC        && !vendor_cfg->allow_etc)    continue;
+				if ((idata->type == IT_HEALING ||
+					 idata->type == IT_USABLE  ||
+					 idata->type == IT_DELAYCONSUME) && !vendor_cfg->allow_usable) continue;
+				auto sit2 = local_seen.find(drop->nameid);
+				if (sit2 == local_seen.end()) {
+					local_seen[drop->nameid] = drop->rate;
+					built.push_back({ drop->nameid, drop->rate });
+				} else if (drop->rate > sit2->second) {
+					sit2->second = drop->rate;
+				}
+			}
+		}
+	}
+	auto inserted = bucket.drops_by_mid.emplace(src_mid, std::move(built));
+	return inserted.first->second;
+}
+
+static void population_engine_build_dynamic_vendor_stock(map_session_data* sd, const PopulationVendorEntry*& vendor_cfg, int max_slots, std::vector<PopulationShellVendorStockItem>& stock)
+{
+	// Dynamic vending: derive saleable items from mob drop tables across one or
+	// more *source* maps (NOT the spawn map — towns have empty moblist[]).
+	// Map selection priority:
+	//   1) explicit SourceMaps list
+	//   2) auto-discovery from population_spawn_db() filtered by SourceCategory
+	//   3) legacy: spawn map only
+	//
+	// Both the source-map list and the per-map drop pool are cached in
+	// g_pop_vendor_dyn_cache (cleared on YAML reload). This avoids
+	// re-walking every map's moblist on every shell spawn.
+	const uint32_t pct = vendor_cfg->price_multiplier;
+	using DropEntry = PopVendorDropEntry;
+	std::vector<DropEntry> drop_pool;
+	std::unordered_map<t_itemid, uint32_t> seen;
+
+	std::vector<int16> source_mids = population_engine_vendor_source_maps(sd, vendor_cfg);
+
+	// RandomizePerShell: shuffle the source list so each shell starts
+	// from a different "primary" map. We still walk additional maps
+	// (in shuffled order) until drop_pool reaches max_slots, so a
+	// dungeon with few drops is topped up from sibling dungeons.
+	if (vendor_cfg->randomize_per_shell && source_mids.size() > 1) {
+		for (size_t i = source_mids.size() - 1; i > 0; --i) {
+			const size_t j = static_cast<size_t>(rnd()) % (i + 1);
+			std::swap(source_mids[i], source_mids[j]);
+		}
+	}
+
+	// Helper: build (or fetch from cache) the drop pool for one source map.
+
+
+	// Aggregate drops from selected source maps (cached lookups).
+	// We collect ~6x max_slots so the "top by drop rate" sort below
+	// has a meaningful pool to pick from AND the 2x overflow stock
+	// builder still has spares after rate-sorting. When randomize_
+	// per_shell is set, source_mids was shuffled above so the primary
+	// dungeon contributes first and siblings only top-up the deficit.
+	const size_t collect_target = static_cast<size_t>(std::max(max_slots * 6, 60));
+	for (int16 src_mid : source_mids) {
+		if (drop_pool.size() >= collect_target) break;
+		const std::vector<DropEntry> &mid_pool = population_engine_vendor_drop_pool(vendor_cfg, src_mid);
+		for (const auto &de : mid_pool) {
+			if (drop_pool.size() >= collect_target) break;
+			auto sit2 = seen.find(de.nameid);
+			if (sit2 == seen.end()) {
+				seen[de.nameid] = de.rate;
+				drop_pool.push_back(de);
+			} else if (de.rate > sit2->second) {
+				sit2->second = de.rate;
+			}
+		}
+	}
+
+	// Sort by drop rate descending, take best max_slots items.
+	std::sort(drop_pool.begin(), drop_pool.end(),
+		[](const DropEntry &a, const DropEntry &b) { return a.rate > b.rate; });
+
+	// MaxAmount: optional [lo,hi] range to randomize per-item stack size.
+	const int dyn_lo = vendor_cfg->dyn_amount_min > 0 ? vendor_cfg->dyn_amount_min : 30;
+	const int dyn_hi = vendor_cfg->dyn_amount_max > 0 ? vendor_cfg->dyn_amount_max : 30;
+
+	// Produce a 2x overflow so the cart-add loop below has spares
+	// when pc_cart_additem rejects items (NoTrade / NoCart / equipment
+	// type restrictions / etc.). Without overflow a vend that loses
+	// even one item to a failed add ends up below MaxSlots.
+	const int stock_cap = max_slots * 2;
+	int count = 0;
+	for (const auto &de : drop_pool) {
+		if (count >= stock_cap) break;
+		auto idata = item_db.find(de.nameid);
+		const uint32_t sell_val = idata ? static_cast<uint32_t>(idata->value_sell) : 0;
+		const uint32_t price = std::max<uint32_t>(1, sell_val * pct / 100);
+		int16 amt;
+		if (idata && idata->equip != 0) {
+			amt = 1; // equipment is non-stackable
+		} else if (dyn_hi > dyn_lo) {
+			amt = static_cast<int16>(dyn_lo + (rnd() % (dyn_hi - dyn_lo + 1)));
+		} else {
+			amt = static_cast<int16>(dyn_lo);
+		}
+		stock.push_back({ de.nameid, amt, price });
+		++count;
+	}
+	// Fallthrough to built-in defaults if no source maps resolved any drops.
+	if (stock.empty())
+		vendor_cfg = nullptr; // force built-in below
+}
+
+static void population_engine_open_shell_vendor(map_session_data* sd, const std::vector<PopulationShellVendorStockItem>& stock, int max_slots, const char* vend_title)
+{
+	// Grant MC_VENDING and cart.
+	pc_skill(sd, MC_VENDING, 10, ADDSKILL_PERMANENT_GRANTED);
+	pc_setcart(sd, 1);
+
+	// Population vendor bots are virtual — they never move, never trade beyond
+	// their initial vend, and don't compete with real players for inventory.
+	// The default cart_weight_max (battle_config.max_cart_weight, typically
+	// 8000) is the *real cause* of vendors stocking < MaxSlots items: a
+	// dynamic vendor with MaxAmount: [1, 30000] can produce stacks weighing
+	// hundreds of thousands of units, so after 1–2 items pc_cart_additem
+	// returns ADDITEM_OVERWEIGHT for everything else. Lift the cap here so
+	// the cart can hold all max_slots stacks regardless of MaxAmount/weight.
+	// (status_calc_pc may later reset this from battle_config, but the cart-
+	// add loop runs synchronously here so the items are already inserted.)
+	sd->cart_weight_max = INT32_MAX;
+
+	// Stock cart and build vending data.
+	int vend_count = 0;
+	uint8 vend_data[MAX_VENDING * 8];
+	memset(vend_data, 0, sizeof(vend_data));
+
+	for (const auto &vs : stock) {
+		if (vend_count >= max_slots) break;
+
+		std::shared_ptr<item_data> id = item_db.find(vs.nameid);
+		if (!id) continue;
+
+		// Equipment is non-stackable: only 1 unit can occupy a cart slot,
+		// so cap amount to 1 to avoid failed pc_cart_additem or bogus vend counts.
+		const bool is_equip = (id->equip != 0);
+		const int16 slot_amount = is_equip ? 1 : static_cast<int16>(vs.amount);
+
+		struct item tmp_item = {};
+		tmp_item.nameid = vs.nameid;
+		tmp_item.amount = 1;
+		tmp_item.identify = 1;
+		if (pc_cart_additem(sd, &tmp_item, slot_amount, LOG_TYPE_NONE) != ADDITEM_SUCCESS)
+			continue;
+
+		int cart_idx = -1;
+		for (int ci = 0; ci < MAX_CART; ci++) {
+			if (sd->cart.u.items_cart[ci].nameid == vs.nameid) {
+				cart_idx = ci;
+				break;
+			}
+		}
+		if (cart_idx < 0) continue;
+
+		// price_override 0 = use item buy price (prevents sell-back arbitrage).
+		const uint32 price = vs.price_override > 0
+			? vs.price_override
+			: static_cast<uint32>(id->value_buy > 0 ? id->value_buy : 100);
+		*(uint16*)(vend_data + vend_count * 8 + 0) = static_cast<uint16>(cart_idx + 2);
+		*(uint16*)(vend_data + vend_count * 8 + 2) = static_cast<uint16>(slot_amount);
+		*(uint32*)(vend_data + vend_count * 8 + 4) = price;
+		vend_count++;
+	}
+
+	if (vend_count > 0) {
+		sd->state.prevend = 1;
+		vending_openvending(*sd, vend_title, vend_data, vend_count, nullptr);
+	}
+}
+
+static void population_engine_start_shell_vendor(map_session_data* sd, const PopulationEngine* pop_cfg)
+{
+	// Vending economy: stock cart and open a real vend.
+	if (battle_config.population_engine_vending_enable) {
+		// Look up optional per-job vendor config from population_vendors.yml.
+		const PopulationVendorEntry *vendor_cfg = nullptr;
+		if (pop_cfg && !pop_cfg->vendor_key.empty())
+			vendor_cfg = population_vendor_db().find(pop_cfg->vendor_key);
+
+		// Determine vend title (vendor_cfg title > VendorMessage > fallback "Shop").
+		const char *vend_title = "Shop";
+		if (vendor_cfg && !vendor_cfg->title.empty())
+			vend_title = vendor_cfg->title.c_str();
+		else if (pop_cfg && !pop_cfg->vendor_message.empty())
+			vend_title = pop_cfg->vendor_message.c_str();
+
+		// Build the stock list to use.
+		// Priority: static vendor_cfg stock → dynamic (map mob drops) → built-in defaults.
+		std::vector<PopulationShellVendorStockItem> stock;
+		const int max_slots = vendor_cfg ? vendor_cfg->max_slots : 12;
+
+		if (vendor_cfg && !vendor_cfg->dynamic && !vendor_cfg->stock.empty()) {
+			// Static vending: use exactly the YAML-defined stock.
+			for (const auto &vs : vendor_cfg->stock)
+				stock.push_back({ vs.nameid, vs.amount, vs.price });
+
+		} else if (vendor_cfg && vendor_cfg->dynamic) {
+			population_engine_build_dynamic_vendor_stock(sd, vendor_cfg, max_slots, stock);
+
+		}
+
+		if (!vendor_cfg || stock.empty()) {
+			// Built-in default consumable stock.
+			static const PopulationShellVendorStockItem kDefaultStock[] = {
+				{ 501, 100, 0 },  // Red Potion
+				{ 502, 100, 0 },  // Orange Potion
+				{ 503,  50, 0 },  // Yellow Potion
+				{ 504,  30, 0 },  // White Potion
+				{ 506,  50, 0 },  // Green Potion
+				{ 601,  50, 0 },  // Wing of Fly
+				{ 602,  30, 0 },  // Wing of Butterfly
+				{ 605,  50, 0 },  // Anodyne
+				{ 606,  50, 0 },  // Aloevera
+				{ 645,  20, 0 },  // Concentration Potion
+				{ 656,  20, 0 },  // Awakening Potion
+			};
+			for (const auto &s : kDefaultStock)
+				stock.push_back(s);
+		}
+
+		population_engine_open_shell_vendor(sd, stock, max_slots, vend_title);
+
+	}
+}
+
+static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, int y, uint32_t index,
+	uint16_t job_id, char sex, uint8_t hair_style, uint16_t hair_color,
+	uint16_t weapon, uint16_t shield, uint16_t head_top, uint16_t head_mid,
+	uint16_t head_bottom, uint32_t option, uint16_t cloth_color, uint16_t garment,
+	struct script_code* init_script, bool skip_arrow, const PopulationEngine* pop_cfg,
+	uint8_t map_category,
+	PopulationDbSource db_source)
+{
+	PE_PERF_SCOPE("spawn_shell");
+
+	if (map_id < 0) {
+		ShowError("Population engine: Invalid map_id %d\n", map_id);
+		return nullptr;
+	}
+	if (!map_getcell(map_id, x, y, CELL_CHKPASS)) {
+		ShowWarning("Population engine: Spawn position (%d,%d) on map %d is not walkable, skipping population shell %u\n",
+			x, y, map_id, index);
+		return nullptr;
+	}
+
+	uint8_t eff_hair = hair_style;
+	uint16_t eff_hair_color = hair_color;
+	uint16_t eff_cloth = cloth_color;
+	if (pop_cfg != nullptr) {
+		if (pop_cfg->hair_min >= 0) {
+			const int16_t hmax = pop_cfg->hair_max >= 0 ? pop_cfg->hair_max : pop_cfg->hair_min;
+			eff_hair = static_cast<uint8_t>(cap_value(population_roll_closed_range(pop_cfg->hair_min, hmax), MIN_HAIR_STYLE, MAX_HAIR_STYLE));
+		}
+		if (pop_cfg->hair_color_min >= 0) {
+			const int16_t hmax = pop_cfg->hair_color_max >= 0 ? pop_cfg->hair_color_max : pop_cfg->hair_color_min;
+			eff_hair_color = static_cast<uint16_t>(cap_value(population_roll_closed_range(pop_cfg->hair_color_min, hmax), MIN_HAIR_COLOR, MAX_HAIR_COLOR));
+		}
+		if (pop_cfg->cloth_color_min >= 0) {
+			const int16_t hmax = pop_cfg->cloth_color_max >= 0 ? pop_cfg->cloth_color_max : pop_cfg->cloth_color_min;
+			eff_cloth = static_cast<uint16_t>(cap_value(population_roll_closed_range(pop_cfg->cloth_color_min, hmax), MIN_CLOTH_COLOR, MAX_CLOTH_COLOR));
+		}
+	}
+
+	std::string name = generate_population_pc_name(index, pop_cfg);
+	const uint32_t account_id = POPULATION_ENGINE_ACCOUNT_ID_BASE + index;
+	const uint32_t char_id    = POPULATION_ENGINE_CHAR_ID_BASE    + index;
+
+	map_session_data* sd = nullptr;
+	CREATE(sd, map_session_data, 1);
+	new (sd) map_session_data();
+	// CREATE uses memset(0) which overrides C++ default member initializers.
+	// Explicitly set any fields whose sentinel value is NOT zero.
+	sd->pop.respawn_timer = INVALID_TIMER;
+
+	const t_tick tick = gettick();
+	pc_setnewpc(sd, account_id, char_id, 0, tick, (sex == 'M' ? SEX_MALE : SEX_FEMALE), 0);
+
+	sd->group_id = 0;
+	pc_group_pc_load(sd);
+	if (!sd->group) {
+		ShowError("Population engine: no valid group (group_id=0) for population shell %u; using minimal defaults.\n", index);
+		sd->group = std::make_shared<s_player_group>();
+		sd->group->id    = 0;
+		sd->group->level = 0;
+		sd->group->log_commands = false;
+	}
+	if (sd->group->has_permission(PC_PERM_ALL_SKILL)) {
+		std::bitset<PC_PERM_MAX> perms = sd->permissions;
+		perms.reset(PC_PERM_ALL_SKILL);
+		sd->permissions = perms;
+	}
+
+	memset(&sd->status, 0, sizeof(struct mmo_charstatus));
+	sd->status.char_id    = char_id;
+	sd->status.account_id = account_id;
+	sd->status.sex = (sex == 'M' ? SEX_MALE : SEX_FEMALE);
+	safestrncpy(sd->status.name, name.c_str(), sizeof(sd->status.name));
+
+	sd->status.class_ = job_id;
+	uint64 class_mapid = pc_jobid2mapid(job_id);
+	if (class_mapid == (uint64)-1 || !job_db.exists(job_id)) {
+		ShowError("Population engine: Invalid job %d for population shell %u; skipping spawn.\n", job_id, index);
+		population_engine_destroy_failed_spawn(sd);
+		return nullptr;
+	} else {
+		sd->class_ = class_mapid;
+		int32 verify_job = pc_mapid2jobid(class_mapid, (sex == 'M' ? 1 : 0));
+		if (verify_job != (int32)job_id && get_job_required_sex(job_id) != '\0') {
+			ShowWarning("Population engine: Job/MAPID mismatch for population shell %u: job_id=%d, mapid=%llu, sex=%c, verify_job=%d\n",
+				index, job_id, (unsigned long long)class_mapid, sex, verify_job);
+			sd->status.class_ = verify_job;
+		}
+	}
+
+	sd->status.hair         = cap_value(eff_hair, MIN_HAIR_STYLE, MAX_HAIR_STYLE);
+	sd->status.hair_color   = cap_value(eff_hair_color, MIN_HAIR_COLOR, MAX_HAIR_COLOR);
+	sd->status.clothes_color = cap_value(eff_cloth, MIN_CLOTH_COLOR, MAX_CLOTH_COLOR);
+	sd->status.body         = sd->status.class_;
+	// status.weapon is weapon_type enum, not an item id; pc_calcweapontype sets it after equip.
+	sd->status.weapon     = W_FIST;
+	sd->status.shield     = shield;
+	sd->status.head_top   = head_top;
+	sd->status.head_mid   = head_mid;
+	sd->status.head_bottom = head_bottom;
+	sd->status.robe       = garment;
+	sd->status.option     = option;
+
+	population_engine_initialize_shell_stats(sd, pop_cfg);
+
+	const char* mapname = map_mapid2mapname(map_id);
+	if (!mapname || !mapname[0]) {
+		ShowError("Population engine: Invalid map name for map_id %d\n", map_id);
+		population_engine_destroy_failed_spawn(sd);
+		return nullptr;
+	}
+	safestrncpy(sd->status.last_point.map, mapname, sizeof(sd->status.last_point.map));
+	sd->status.last_point.x = x;
+	sd->status.last_point.y = y;
+	safestrncpy(sd->status.save_point.map, mapname, sizeof(sd->status.save_point.map));
+	sd->status.save_point.x = x;
+	sd->status.save_point.y = y;
+
+	population_engine_initialize_shell_runtime(sd, tick, pop_cfg, map_category);
+
+	if (!population_engine_place_shell(sd, mapname, x, y, index))
+		return nullptr;
+
+	population_engine_initialize_shell_status(sd, job_id, index);
+
+	population_engine_grant_shell_skills(sd, pop_cfg, index);
+
+	population_engine_equip_shell_weapon(sd, weapon, index);
+
+	population_engine_equip_shell_ammo(sd, weapon, skip_arrow, init_script, index);
+
+	population_engine_equip_shell_armor(sd, shield, head_top, head_mid, head_bottom, garment);
+
+	population_engine_stock_shell_supplies(sd, pop_cfg, job_id, index);
+
+	population_engine_apply_shell_scripts(sd, init_script, pop_cfg);
+
+	population_engine_publish_shell_appearance(sd);
+
+	if (!population_engine_combat_try_start(sd)) {
+		population_engine_shell_release(sd);
+		return nullptr;
+	}
+
+	clif_spawn(sd);
+
+	const PopulationBehavior pe_beh = population_engine_start_shell_behavior(
+		sd, map_id, x, y, map_category, db_source, pop_cfg);
 
 	// Behavior-specific startup.
-	if (pe_beh == PopulationBehavior::Sit) {
+	if (pe_beh == PopulationBehavior::Sit || pe_beh == PopulationBehavior::Hangout) {
 		pc_setsit(sd);
 		clif_sitting(*sd);
 	} else if (pe_beh == PopulationBehavior::Vendor) {
@@ -2351,276 +2908,11 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 		if (pop_cfg && !pop_cfg->vendor_message.empty())
 			clif_messagecolor(sd, color_table[COLOR_YELLOW], pop_cfg->vendor_message.c_str(), false, AREA_WOS);
 
-		// Vending economy: stock cart and open a real vend.
-		if (battle_config.population_engine_vending_enable) {
-			// Look up optional per-job vendor config from population_vendors.yml.
-			const PopulationVendorEntry *vendor_cfg = nullptr;
-			if (pop_cfg && !pop_cfg->vendor_key.empty())
-				vendor_cfg = population_vendor_db().find(pop_cfg->vendor_key);
+		population_engine_start_shell_vendor(sd, pop_cfg);
 
-			// Determine vend title (vendor_cfg title > VendorMessage > fallback "Shop").
-			const char *vend_title = "Shop";
-			if (vendor_cfg && !vendor_cfg->title.empty())
-				vend_title = vendor_cfg->title.c_str();
-			else if (pop_cfg && !pop_cfg->vendor_message.empty())
-				vend_title = pop_cfg->vendor_message.c_str();
-
-			// Build the stock list to use.
-			// Priority: static vendor_cfg stock → dynamic (map mob drops) → built-in defaults.
-			struct TmpStock { t_itemid nameid; int16 amount; uint32_t price_override; };
-			std::vector<TmpStock> stock;
-			const int max_slots = vendor_cfg ? vendor_cfg->max_slots : 12;
-
-			if (vendor_cfg && !vendor_cfg->dynamic && !vendor_cfg->stock.empty()) {
-				// Static vending: use exactly the YAML-defined stock.
-				for (const auto &vs : vendor_cfg->stock)
-					stock.push_back({ vs.nameid, vs.amount, vs.price });
-
-			} else if (vendor_cfg && vendor_cfg->dynamic) {
-				// Dynamic vending: derive saleable items from mob drop tables across one or
-				// more *source* maps (NOT the spawn map — towns have empty moblist[]).
-				// Map selection priority:
-				//   1) explicit SourceMaps list
-				//   2) auto-discovery from population_spawn_db() filtered by SourceCategory
-				//   3) legacy: spawn map only
-				//
-				// Both the source-map list and the per-map drop pool are cached in
-				// g_pop_vendor_dyn_cache (cleared on YAML reload). This avoids
-				// re-walking every map's moblist on every shell spawn.
-				const uint32_t pct = vendor_cfg->price_multiplier;
-				using DropEntry = PopVendorDropEntry;
-				std::vector<DropEntry> drop_pool;
-				std::unordered_map<t_itemid, uint32_t> seen;
-
-				std::vector<int16> source_mids;
-				{
-					PopVendorCacheBucket &bucket = g_pop_vendor_dyn_cache[vendor_cfg->key];
-					if (!bucket.source_mids_built) {
-						if (!vendor_cfg->source_maps.empty()) {
-							for (const std::string& mn : vendor_cfg->source_maps) {
-								const int16 mid = map_mapname2mapid(mn.c_str());
-								if (mid >= 0) bucket.source_mids.push_back(mid);
-							}
-						} else if (!vendor_cfg->source_category.empty()) {
-							const bool want_dungeons = (vendor_cfg->source_category == "dungeon" || vendor_cfg->source_category == "both");
-							const bool want_fields   = (vendor_cfg->source_category == "field"   || vendor_cfg->source_category == "both");
-							std::unordered_set<int16> seen_mids;
-							for (auto sit = population_spawn_db().begin(); sit != population_spawn_db().end(); ++sit) {
-								if (!sit->second) continue;
-								const PopulationSpawnEntry &se = *sit->second;
-								auto add = [&](const std::vector<std::string> &maps) {
-									for (const std::string &mn : maps) {
-										const int16 mid = map_mapname2mapid(mn.c_str());
-										if (mid >= 0 && seen_mids.insert(mid).second)
-											bucket.source_mids.push_back(mid);
-									}
-								};
-								if (want_dungeons) add(se.dungeons);
-								if (want_fields)   add(se.fields);
-							}
-						} else {
-							bucket.source_mids.push_back(sd->m); // legacy: spawn map only
-						}
-						bucket.source_mids_built = true;
-					}
-					source_mids = bucket.source_mids; // copy out; release lock below
-				}
-
-				// RandomizePerShell: shuffle the source list so each shell starts
-				// from a different "primary" map. We still walk additional maps
-				// (in shuffled order) until drop_pool reaches max_slots, so a
-				// dungeon with few drops is topped up from sibling dungeons.
-				if (vendor_cfg->randomize_per_shell && source_mids.size() > 1) {
-					for (size_t i = source_mids.size() - 1; i > 0; --i) {
-						const size_t j = static_cast<size_t>(rnd()) % (i + 1);
-						std::swap(source_mids[i], source_mids[j]);
-					}
-				}
-
-				// Helper: build (or fetch from cache) the drop pool for one source map.
-				auto get_mid_pool = [&](int16 src_mid) -> const std::vector<DropEntry>& {
-					PopVendorCacheBucket &bucket = g_pop_vendor_dyn_cache[vendor_cfg->key];
-					auto it = bucket.drops_by_mid.find(src_mid);
-					if (it != bucket.drops_by_mid.end()) return it->second;
-					std::vector<DropEntry> built;
-					struct map_data *src_map = map_getmapdata(src_mid);
-					if (src_map) {
-						std::unordered_map<t_itemid, uint32_t> local_seen;
-						for (int i = 0; i < MAX_MOB_LIST_PER_MAP; ++i) {
-							if (!src_map->moblist[i]) continue;
-							const int16 mob_id = src_map->moblist[i]->id;
-							if (mob_id <= 0) continue;
-							auto mdb = mob_db.find(static_cast<uint32>(mob_id));
-							if (!mdb) continue;
-							for (const auto &drop : mdb->dropitem) {
-								if (!drop || drop->nameid == 0) continue;
-								auto idata = item_db.find(drop->nameid);
-								if (!idata) continue;
-								// Apply ItemFlags filters at cache time (filters are part of the vendor key).
-								const bool is_equip = (idata->equip != 0);
-								if (is_equip && !vendor_cfg->allow_equipment) continue;
-								if (idata->type == IT_CARD       && !vendor_cfg->allow_cards)  continue;
-								if (idata->type == IT_ETC        && !vendor_cfg->allow_etc)    continue;
-								if ((idata->type == IT_HEALING ||
-								     idata->type == IT_USABLE  ||
-								     idata->type == IT_DELAYCONSUME) && !vendor_cfg->allow_usable) continue;
-								auto sit2 = local_seen.find(drop->nameid);
-								if (sit2 == local_seen.end()) {
-									local_seen[drop->nameid] = drop->rate;
-									built.push_back({ drop->nameid, drop->rate });
-								} else if (drop->rate > sit2->second) {
-									sit2->second = drop->rate;
-								}
-							}
-						}
-					}
-					auto inserted = bucket.drops_by_mid.emplace(src_mid, std::move(built));
-					return inserted.first->second;
-				};
-
-				// Aggregate drops from selected source maps (cached lookups).
-				// We collect ~6x max_slots so the "top by drop rate" sort below
-				// has a meaningful pool to pick from AND the 2x overflow stock
-				// builder still has spares after rate-sorting. When randomize_
-				// per_shell is set, source_mids was shuffled above so the primary
-				// dungeon contributes first and siblings only top-up the deficit.
-				const size_t collect_target = static_cast<size_t>(std::max(max_slots * 6, 60));
-				for (int16 src_mid : source_mids) {
-					if (drop_pool.size() >= collect_target) break;
-					const std::vector<DropEntry> &mid_pool = get_mid_pool(src_mid);
-					for (const auto &de : mid_pool) {
-						if (drop_pool.size() >= collect_target) break;
-						auto sit2 = seen.find(de.nameid);
-						if (sit2 == seen.end()) {
-							seen[de.nameid] = de.rate;
-							drop_pool.push_back(de);
-						} else if (de.rate > sit2->second) {
-							sit2->second = de.rate;
-						}
-					}
-				}
-
-				// Sort by drop rate descending, take best max_slots items.
-				std::sort(drop_pool.begin(), drop_pool.end(),
-					[](const DropEntry &a, const DropEntry &b) { return a.rate > b.rate; });
-
-				// MaxAmount: optional [lo,hi] range to randomize per-item stack size.
-				const int dyn_lo = vendor_cfg->dyn_amount_min > 0 ? vendor_cfg->dyn_amount_min : 30;
-				const int dyn_hi = vendor_cfg->dyn_amount_max > 0 ? vendor_cfg->dyn_amount_max : 30;
-
-				// Produce a 2x overflow so the cart-add loop below has spares
-				// when pc_cart_additem rejects items (NoTrade / NoCart / equipment
-				// type restrictions / etc.). Without overflow a vend that loses
-				// even one item to a failed add ends up below MaxSlots.
-				const int stock_cap = max_slots * 2;
-				int count = 0;
-				for (const auto &de : drop_pool) {
-					if (count >= stock_cap) break;
-					auto idata = item_db.find(de.nameid);
-					const uint32_t sell_val = idata ? static_cast<uint32_t>(idata->value_sell) : 0;
-					const uint32_t price = std::max<uint32_t>(1, sell_val * pct / 100);
-					int16 amt;
-					if (idata && idata->equip != 0) {
-						amt = 1; // equipment is non-stackable
-					} else if (dyn_hi > dyn_lo) {
-						amt = static_cast<int16>(dyn_lo + (rnd() % (dyn_hi - dyn_lo + 1)));
-					} else {
-						amt = static_cast<int16>(dyn_lo);
-					}
-					stock.push_back({ de.nameid, amt, price });
-					++count;
-				}
-				// Fallthrough to built-in defaults if no source maps resolved any drops.
-				if (stock.empty())
-					vendor_cfg = nullptr; // force built-in below
-
-			}
-
-			if (!vendor_cfg || stock.empty()) {
-				// Built-in default consumable stock.
-				static const TmpStock kDefaultStock[] = {
-					{ 501, 100, 0 },  // Red Potion
-					{ 502, 100, 0 },  // Orange Potion
-					{ 503,  50, 0 },  // Yellow Potion
-					{ 504,  30, 0 },  // White Potion
-					{ 506,  50, 0 },  // Green Potion
-					{ 601,  50, 0 },  // Wing of Fly
-					{ 602,  30, 0 },  // Wing of Butterfly
-					{ 605,  50, 0 },  // Anodyne
-					{ 606,  50, 0 },  // Aloevera
-					{ 645,  20, 0 },  // Concentration Potion
-					{ 656,  20, 0 },  // Awakening Potion
-				};
-				for (const auto &s : kDefaultStock)
-					stock.push_back(s);
-			}
-
-			// Grant MC_VENDING and cart.
-			pc_skill(sd, MC_VENDING, 10, ADDSKILL_PERMANENT_GRANTED);
-			pc_setcart(sd, 1);
-
-			// Population vendor bots are virtual — they never move, never trade beyond
-			// their initial vend, and don't compete with real players for inventory.
-			// The default cart_weight_max (battle_config.max_cart_weight, typically
-			// 8000) is the *real cause* of vendors stocking < MaxSlots items: a
-			// dynamic vendor with MaxAmount: [1, 30000] can produce stacks weighing
-			// hundreds of thousands of units, so after 1–2 items pc_cart_additem
-			// returns ADDITEM_OVERWEIGHT for everything else. Lift the cap here so
-			// the cart can hold all max_slots stacks regardless of MaxAmount/weight.
-			// (status_calc_pc may later reset this from battle_config, but the cart-
-			// add loop runs synchronously here so the items are already inserted.)
-			sd->cart_weight_max = INT32_MAX;
-
-			// Stock cart and build vending data.
-			int vend_count = 0;
-			uint8 vend_data[MAX_VENDING * 8];
-			memset(vend_data, 0, sizeof(vend_data));
-
-			for (const auto &vs : stock) {
-				if (vend_count >= max_slots) break;
-
-				std::shared_ptr<item_data> id = item_db.find(vs.nameid);
-				if (!id) continue;
-
-				// Equipment is non-stackable: only 1 unit can occupy a cart slot,
-				// so cap amount to 1 to avoid failed pc_cart_additem or bogus vend counts.
-				const bool is_equip = (id->equip != 0);
-				const int16 slot_amount = is_equip ? 1 : static_cast<int16>(vs.amount);
-
-				struct item tmp_item = {};
-				tmp_item.nameid = vs.nameid;
-				tmp_item.amount = 1;
-				tmp_item.identify = 1;
-				if (pc_cart_additem(sd, &tmp_item, slot_amount, LOG_TYPE_NONE) != ADDITEM_SUCCESS)
-					continue;
-
-				int cart_idx = -1;
-				for (int ci = 0; ci < MAX_CART; ci++) {
-					if (sd->cart.u.items_cart[ci].nameid == vs.nameid) {
-						cart_idx = ci;
-						break;
-					}
-				}
-				if (cart_idx < 0) continue;
-
-				// price_override 0 = use item buy price (prevents sell-back arbitrage).
-				const uint32 price = vs.price_override > 0
-					? vs.price_override
-					: static_cast<uint32>(id->value_buy > 0 ? id->value_buy : 100);
-				*(uint16*)(vend_data + vend_count * 8 + 0) = static_cast<uint16>(cart_idx + 2);
-				*(uint16*)(vend_data + vend_count * 8 + 2) = static_cast<uint16>(slot_amount);
-				*(uint32*)(vend_data + vend_count * 8 + 4) = price;
-				vend_count++;
-			}
-
-			if (vend_count > 0) {
-				sd->state.prevend = 1;
-				vending_openvending(*sd, vend_title, vend_data, vend_count, nullptr);
-			}
-		}
 	}
 
-    return sd;
+	return sd;
 }
 
 // Generate bot name — used as last-resort fallback.
@@ -2701,246 +2993,203 @@ static std::string generate_population_pc_name(uint32_t index, const PopulationE
 
 // Get random job ID (only jobs with proper sprites - conservative whitelist)
 static int16_t get_random_job_id() {
-    // Conservative whitelist of jobs that definitely have proper sprites
-    // Based on jobmaster.txt and standard RO jobs that are commonly used
-    // Excludes jobs that may pass pcdb_checkid() but don't have client-side sprites
+	// Conservative whitelist of jobs that definitely have proper sprites
+	// Based on jobmaster.txt and standard RO jobs that are commonly used
+	// Excludes jobs that may pass pcdb_checkid() but don't have client-side sprites
 #ifdef RENEWAL
-    static const int16_t jobs_with_sprites[] = {
-        // Basic 1-1 jobs (core jobs)
-        JOB_NOVICE, JOB_SWORDMAN, JOB_MAGE, JOB_ARCHER, JOB_ACOLYTE, JOB_MERCHANT, JOB_THIEF,
-        // 2-1 jobs (core jobs)
-        JOB_KNIGHT, JOB_PRIEST, JOB_WIZARD, JOB_BLACKSMITH, JOB_HUNTER, JOB_ASSASSIN,
-        // 2-2 jobs (core jobs)
-        JOB_CRUSADER, JOB_MONK, JOB_SAGE, JOB_ROGUE, JOB_ALCHEMIST, JOB_BARD, JOB_DANCER,
-        // Special basic jobs (confirmed to have sprites)
-        JOB_SUPER_NOVICE, JOB_GUNSLINGER, JOB_NINJA, JOB_TAEKWON,
-        // High/Trans 1-1 jobs
-        JOB_NOVICE_HIGH, JOB_SWORDMAN_HIGH, JOB_MAGE_HIGH, JOB_ARCHER_HIGH, JOB_ACOLYTE_HIGH, JOB_MERCHANT_HIGH, JOB_THIEF_HIGH,
-        // High/Trans 2-1 jobs
-        JOB_LORD_KNIGHT, JOB_HIGH_PRIEST, JOB_HIGH_WIZARD, JOB_WHITESMITH, JOB_SNIPER, JOB_ASSASSIN_CROSS,
-        // High/Trans 2-2 jobs
-        JOB_PALADIN, JOB_CHAMPION, JOB_PROFESSOR, JOB_STALKER, JOB_CREATOR, JOB_CLOWN, JOB_GYPSY,
-        // Baby 1-1 jobs
-        JOB_BABY, JOB_BABY_SWORDMAN, JOB_BABY_MAGE, JOB_BABY_ARCHER, JOB_BABY_ACOLYTE, JOB_BABY_MERCHANT, JOB_BABY_THIEF,
-        // Baby 2-1 jobs
-        JOB_BABY_KNIGHT, JOB_BABY_PRIEST, JOB_BABY_WIZARD, JOB_BABY_BLACKSMITH, JOB_BABY_HUNTER, JOB_BABY_ASSASSIN,
-        // Baby 2-2 jobs
-        JOB_BABY_CRUSADER, JOB_BABY_MONK, JOB_BABY_SAGE, JOB_BABY_ROGUE, JOB_BABY_ALCHEMIST, JOB_BABY_BARD, JOB_BABY_DANCER, JOB_SUPER_BABY,
-        // Special expanded jobs (confirmed in jobmaster.txt)
-        JOB_STAR_GLADIATOR, JOB_SOUL_LINKER,
-        // 3rd jobs 2-1 (confirmed in jobmaster.txt)
-        JOB_RUNE_KNIGHT, JOB_WARLOCK, JOB_RANGER, JOB_ARCH_BISHOP, JOB_MECHANIC, JOB_GUILLOTINE_CROSS,
-        // 3rd jobs 2-1 trans (confirmed in jobmaster.txt)
-        JOB_RUNE_KNIGHT_T, JOB_WARLOCK_T, JOB_RANGER_T, JOB_ARCH_BISHOP_T, JOB_MECHANIC_T, JOB_GUILLOTINE_CROSS_T,
-        // 3rd jobs 2-2 (confirmed in jobmaster.txt)
-        JOB_ROYAL_GUARD, JOB_SORCERER, JOB_MINSTREL, JOB_WANDERER, JOB_SURA, JOB_GENETIC, JOB_SHADOW_CHASER,
-        // 3rd jobs 2-2 trans (confirmed in jobmaster.txt)
-        JOB_ROYAL_GUARD_T, JOB_SORCERER_T, JOB_MINSTREL_T, JOB_WANDERER_T, JOB_SURA_T, JOB_GENETIC_T, JOB_SHADOW_CHASER_T,
-        // Baby 3rd jobs (conservative - only base versions)
-        JOB_BABY_RUNE_KNIGHT, JOB_BABY_WARLOCK, JOB_BABY_RANGER, JOB_BABY_ARCH_BISHOP, JOB_BABY_MECHANIC, JOB_BABY_GUILLOTINE_CROSS,
-        JOB_BABY_ROYAL_GUARD, JOB_BABY_SORCERER, JOB_BABY_MINSTREL, JOB_BABY_WANDERER, JOB_BABY_SURA, JOB_BABY_GENETIC, JOB_BABY_SHADOW_CHASER,
-        // Super Novice Expanded
-        JOB_SUPER_NOVICE_E, JOB_SUPER_BABY_E,
-        // Kagerou/Oboro (confirmed in jobmaster.txt)
-        JOB_KAGEROU, JOB_OBORO,
-        // Rebellion (confirmed in jobmaster.txt)
-        JOB_REBELLION,
-        // Baby expanded jobs (conservative - only basic ones)
-        JOB_BABY_NINJA, JOB_BABY_TAEKWON, JOB_BABY_GUNSLINGER,
-        // Star Emperor/Soul Reaper (only base versions - _2 variants may not have sprites)
-        JOB_STAR_EMPEROR, JOB_SOUL_REAPER, JOB_BABY_STAR_EMPEROR, JOB_BABY_SOUL_REAPER,
-        // 4th jobs (confirmed in jobmaster.txt - only base versions)
-        JOB_DRAGON_KNIGHT, JOB_MEISTER, JOB_SHADOW_CROSS, JOB_ARCH_MAGE, JOB_CARDINAL, JOB_WINDHAWK,
-        JOB_IMPERIAL_GUARD, JOB_BIOLO, JOB_ABYSS_CHASER, JOB_ELEMENTAL_MASTER, JOB_INQUISITOR, JOB_TROUBADOUR, JOB_TROUVERE,
-        JOB_SKY_EMPEROR, JOB_SOUL_ASCETIC, JOB_SHINKIRO, JOB_SHIRANUI, JOB_NIGHT_WATCH, JOB_HYPER_NOVICE
-    };
+	static const int16_t jobs_with_sprites[] = {
+		// Basic 1-1 jobs (core jobs)
+		JOB_NOVICE, JOB_SWORDMAN, JOB_MAGE, JOB_ARCHER, JOB_ACOLYTE, JOB_MERCHANT, JOB_THIEF,
+		// 2-1 jobs (core jobs)
+		JOB_KNIGHT, JOB_PRIEST, JOB_WIZARD, JOB_BLACKSMITH, JOB_HUNTER, JOB_ASSASSIN,
+		// 2-2 jobs (core jobs)
+		JOB_CRUSADER, JOB_MONK, JOB_SAGE, JOB_ROGUE, JOB_ALCHEMIST, JOB_BARD, JOB_DANCER,
+		// Special basic jobs (confirmed to have sprites)
+		JOB_SUPER_NOVICE, JOB_GUNSLINGER, JOB_NINJA, JOB_TAEKWON,
+		// High/Trans 1-1 jobs
+		JOB_NOVICE_HIGH, JOB_SWORDMAN_HIGH, JOB_MAGE_HIGH, JOB_ARCHER_HIGH, JOB_ACOLYTE_HIGH, JOB_MERCHANT_HIGH, JOB_THIEF_HIGH,
+		// High/Trans 2-1 jobs
+		JOB_LORD_KNIGHT, JOB_HIGH_PRIEST, JOB_HIGH_WIZARD, JOB_WHITESMITH, JOB_SNIPER, JOB_ASSASSIN_CROSS,
+		// High/Trans 2-2 jobs
+		JOB_PALADIN, JOB_CHAMPION, JOB_PROFESSOR, JOB_STALKER, JOB_CREATOR, JOB_CLOWN, JOB_GYPSY,
+		// Baby 1-1 jobs
+		JOB_BABY, JOB_BABY_SWORDMAN, JOB_BABY_MAGE, JOB_BABY_ARCHER, JOB_BABY_ACOLYTE, JOB_BABY_MERCHANT, JOB_BABY_THIEF,
+		// Baby 2-1 jobs
+		JOB_BABY_KNIGHT, JOB_BABY_PRIEST, JOB_BABY_WIZARD, JOB_BABY_BLACKSMITH, JOB_BABY_HUNTER, JOB_BABY_ASSASSIN,
+		// Baby 2-2 jobs
+		JOB_BABY_CRUSADER, JOB_BABY_MONK, JOB_BABY_SAGE, JOB_BABY_ROGUE, JOB_BABY_ALCHEMIST, JOB_BABY_BARD, JOB_BABY_DANCER, JOB_SUPER_BABY,
+		// Special expanded jobs (confirmed in jobmaster.txt)
+		JOB_STAR_GLADIATOR, JOB_SOUL_LINKER,
+		// 3rd jobs 2-1 (confirmed in jobmaster.txt)
+		JOB_RUNE_KNIGHT, JOB_WARLOCK, JOB_RANGER, JOB_ARCH_BISHOP, JOB_MECHANIC, JOB_GUILLOTINE_CROSS,
+		// 3rd jobs 2-1 trans (confirmed in jobmaster.txt)
+		JOB_RUNE_KNIGHT_T, JOB_WARLOCK_T, JOB_RANGER_T, JOB_ARCH_BISHOP_T, JOB_MECHANIC_T, JOB_GUILLOTINE_CROSS_T,
+		// 3rd jobs 2-2 (confirmed in jobmaster.txt)
+		JOB_ROYAL_GUARD, JOB_SORCERER, JOB_MINSTREL, JOB_WANDERER, JOB_SURA, JOB_GENETIC, JOB_SHADOW_CHASER,
+		// 3rd jobs 2-2 trans (confirmed in jobmaster.txt)
+		JOB_ROYAL_GUARD_T, JOB_SORCERER_T, JOB_MINSTREL_T, JOB_WANDERER_T, JOB_SURA_T, JOB_GENETIC_T, JOB_SHADOW_CHASER_T,
+		// Baby 3rd jobs (conservative - only base versions)
+		JOB_BABY_RUNE_KNIGHT, JOB_BABY_WARLOCK, JOB_BABY_RANGER, JOB_BABY_ARCH_BISHOP, JOB_BABY_MECHANIC, JOB_BABY_GUILLOTINE_CROSS,
+		JOB_BABY_ROYAL_GUARD, JOB_BABY_SORCERER, JOB_BABY_MINSTREL, JOB_BABY_WANDERER, JOB_BABY_SURA, JOB_BABY_GENETIC, JOB_BABY_SHADOW_CHASER,
+		// Super Novice Expanded
+		JOB_SUPER_NOVICE_E, JOB_SUPER_BABY_E,
+		// Kagerou/Oboro (confirmed in jobmaster.txt)
+		JOB_KAGEROU, JOB_OBORO,
+		// Rebellion (confirmed in jobmaster.txt)
+		JOB_REBELLION,
+		// Baby expanded jobs (conservative - only basic ones)
+		JOB_BABY_NINJA, JOB_BABY_TAEKWON, JOB_BABY_GUNSLINGER,
+		// Star Emperor/Soul Reaper (only base versions - _2 variants may not have sprites)
+		JOB_STAR_EMPEROR, JOB_SOUL_REAPER, JOB_BABY_STAR_EMPEROR, JOB_BABY_SOUL_REAPER,
+
+	};
 #else
-    // Pre-RE: no 3rd/4th/Summoner-era jobs — they are absent from job_db / skill tree and break fake PC spawn.
-    static const int16_t jobs_with_sprites[] = {
-        JOB_NOVICE, JOB_SWORDMAN, JOB_MAGE, JOB_ARCHER, JOB_ACOLYTE, JOB_MERCHANT, JOB_THIEF,
-        JOB_KNIGHT, JOB_PRIEST, JOB_WIZARD, JOB_BLACKSMITH, JOB_HUNTER, JOB_ASSASSIN,
-        JOB_CRUSADER, JOB_MONK, JOB_SAGE, JOB_ROGUE, JOB_ALCHEMIST, JOB_BARD, JOB_DANCER,
-        JOB_SUPER_NOVICE, JOB_GUNSLINGER, JOB_NINJA, JOB_TAEKWON,
-        JOB_NOVICE_HIGH, JOB_SWORDMAN_HIGH, JOB_MAGE_HIGH, JOB_ARCHER_HIGH, JOB_ACOLYTE_HIGH, JOB_MERCHANT_HIGH, JOB_THIEF_HIGH,
-        JOB_LORD_KNIGHT, JOB_HIGH_PRIEST, JOB_HIGH_WIZARD, JOB_WHITESMITH, JOB_SNIPER, JOB_ASSASSIN_CROSS,
-        JOB_PALADIN, JOB_CHAMPION, JOB_PROFESSOR, JOB_STALKER, JOB_CREATOR, JOB_CLOWN, JOB_GYPSY,
-        JOB_BABY, JOB_BABY_SWORDMAN, JOB_BABY_MAGE, JOB_BABY_ARCHER, JOB_BABY_ACOLYTE, JOB_BABY_MERCHANT, JOB_BABY_THIEF,
-        JOB_BABY_KNIGHT, JOB_BABY_PRIEST, JOB_BABY_WIZARD, JOB_BABY_BLACKSMITH, JOB_BABY_HUNTER, JOB_BABY_ASSASSIN,
-        JOB_BABY_CRUSADER, JOB_BABY_MONK, JOB_BABY_SAGE, JOB_BABY_ROGUE, JOB_BABY_ALCHEMIST, JOB_BABY_BARD, JOB_BABY_DANCER, JOB_SUPER_BABY,
-        JOB_STAR_GLADIATOR, JOB_SOUL_LINKER,
-    };
+	// Pre-RE: no 3rd/4th/Summoner-era jobs — they are absent from job_db / skill tree and break fake PC spawn.
+	static const int16_t jobs_with_sprites[] = {
+		JOB_NOVICE, JOB_SWORDMAN, JOB_MAGE, JOB_ARCHER, JOB_ACOLYTE, JOB_MERCHANT, JOB_THIEF,
+		JOB_KNIGHT, JOB_PRIEST, JOB_WIZARD, JOB_BLACKSMITH, JOB_HUNTER, JOB_ASSASSIN,
+		JOB_CRUSADER, JOB_MONK, JOB_SAGE, JOB_ROGUE, JOB_ALCHEMIST, JOB_BARD, JOB_DANCER,
+		JOB_SUPER_NOVICE, JOB_GUNSLINGER, JOB_NINJA, JOB_TAEKWON,
+		JOB_NOVICE_HIGH, JOB_SWORDMAN_HIGH, JOB_MAGE_HIGH, JOB_ARCHER_HIGH, JOB_ACOLYTE_HIGH, JOB_MERCHANT_HIGH, JOB_THIEF_HIGH,
+		JOB_LORD_KNIGHT, JOB_HIGH_PRIEST, JOB_HIGH_WIZARD, JOB_WHITESMITH, JOB_SNIPER, JOB_ASSASSIN_CROSS,
+		JOB_PALADIN, JOB_CHAMPION, JOB_PROFESSOR, JOB_STALKER, JOB_CREATOR, JOB_CLOWN, JOB_GYPSY,
+		JOB_BABY, JOB_BABY_SWORDMAN, JOB_BABY_MAGE, JOB_BABY_ARCHER, JOB_BABY_ACOLYTE, JOB_BABY_MERCHANT, JOB_BABY_THIEF,
+		JOB_BABY_KNIGHT, JOB_BABY_PRIEST, JOB_BABY_WIZARD, JOB_BABY_BLACKSMITH, JOB_BABY_HUNTER, JOB_BABY_ASSASSIN,
+		JOB_BABY_CRUSADER, JOB_BABY_MONK, JOB_BABY_SAGE, JOB_BABY_ROGUE, JOB_BABY_ALCHEMIST, JOB_BABY_BARD, JOB_BABY_DANCER, JOB_SUPER_BABY,
+		JOB_STAR_GLADIATOR, JOB_SOUL_LINKER,
+	};
 #endif
-    
-    // Cache filtered list of valid jobs (jobs with view data AND sprites)
-    static std::vector<int16_t> valid_jobs;
-    static bool initialized = false;
-    
-    if (!initialized) {
-        // Require client view data, server job_db entry, and a valid MAPID (pre-RE rejects renewal-only IDs).
-        for (int16_t job_id : jobs_with_sprites) {
-            if (!pcdb_checkid(job_id))
-                continue;
-            if (!job_db.exists(static_cast<uint16_t>(job_id)))
-                continue;
-            if (pc_jobid2mapid(job_id) == static_cast<uint64_t>(-1))
-                continue;
-            valid_jobs.push_back(job_id);
-        }
-        initialized = true;
-        
-        if (valid_jobs.empty()) {
-            ShowError("Population engine: No valid jobs with sprites found! Using JOB_NOVICE as fallback\n");
-            valid_jobs.push_back(JOB_NOVICE);
-        }
-    }
-    
-    return valid_jobs[rnd() % valid_jobs.size()];
+
+	// Cache filtered list of valid jobs (jobs with view data AND sprites)
+	static std::vector<int16_t> valid_jobs;
+	static bool initialized = false;
+
+	if (!initialized) {
+		// Require client view data, server job_db entry, and a valid MAPID (pre-RE rejects renewal-only IDs).
+		for (int16_t job_id : jobs_with_sprites) {
+			if (!pcdb_checkid(job_id))
+				continue;
+			if (!job_db.exists(static_cast<uint16_t>(job_id)))
+				continue;
+			if (pc_jobid2mapid(job_id) == static_cast<uint64_t>(-1))
+				continue;
+			valid_jobs.push_back(job_id);
+		}
+		initialized = true;
+
+		if (valid_jobs.empty()) {
+			ShowError("Population engine: No valid jobs with sprites found! Using JOB_NOVICE as fallback\n");
+			valid_jobs.push_back(JOB_NOVICE);
+		}
+	}
+
+	return valid_jobs[rnd() % valid_jobs.size()];
 }
 
 // Get a random support-oriented job (ONLY Priest classes as requested)
 // Get the required gender for a job (returns 'M' for male-only, 'F' for female-only, '\0' for gender-neutral)
 static char get_job_required_sex(uint16_t job_id) {
-    // Male-only jobs
-    if (job_id == JOB_BARD || job_id == JOB_CLOWN || 
-        job_id == JOB_MINSTREL || job_id == JOB_MINSTREL_T ||
-        job_id == JOB_BABY_MINSTREL || job_id == JOB_BABY_BARD ||
-        job_id == JOB_KAGEROU || job_id == JOB_BABY_KAGEROU ||
-        job_id == JOB_TROUBADOUR || job_id == JOB_SHINKIRO) {
-        return 'M';
-    }
-    
-    // Female-only jobs
-    if (job_id == JOB_DANCER || job_id == JOB_GYPSY ||
-        job_id == JOB_WANDERER || job_id == JOB_WANDERER_T ||
-        job_id == JOB_BABY_WANDERER || job_id == JOB_BABY_DANCER ||
-        job_id == JOB_OBORO || job_id == JOB_BABY_OBORO ||
-        job_id == JOB_TROUVERE || job_id == JOB_SHIRANUI) {
-        return 'F';
-    }
-    
-    // Gender-neutral jobs
-    return '\0';
+	// Male-only jobs
+	if (job_id == JOB_BARD || job_id == JOB_CLOWN ||
+		job_id == JOB_MINSTREL || job_id == JOB_MINSTREL_T ||
+		job_id == JOB_BABY_MINSTREL || job_id == JOB_BABY_BARD ||
+		job_id == JOB_KAGEROU || job_id == JOB_BABY_KAGEROU ||
+		job_id == JOB_TROUBADOUR || job_id == JOB_SHINKIRO) {
+		return 'M';
+	}
+
+	// Female-only jobs
+	if (job_id == JOB_DANCER || job_id == JOB_GYPSY ||
+		job_id == JOB_WANDERER || job_id == JOB_WANDERER_T ||
+		job_id == JOB_BABY_WANDERER || job_id == JOB_BABY_DANCER ||
+		job_id == JOB_OBORO || job_id == JOB_BABY_OBORO ||
+		job_id == JOB_TROUVERE || job_id == JOB_SHIRANUI) {
+		return 'F';
+	}
+
+	// Gender-neutral jobs
+	return '\0';
 }
 
 static t_itemid find_ammo_item_by_subtype(e_ammo_type sub) {
-    // Prefer lightest ammo with no level requirement so shells of any level can equip it
-    // and the weight-capped add-amount leaves enough room for equipping.
-    // If all matching ammo has a level gate, fall back to the lightest match.
-    t_itemid best = 0;
-    int best_w = INT_MAX;
-    t_itemid fallback = 0;
-    int fallback_w = INT_MAX;
-    for (const auto& it : item_db) {
-        std::shared_ptr<item_data> id = it.second;
-        if (!id || id->nameid == UNKNOWN_ITEM_ID)
-            continue;
-        if (id->type == IT_AMMO && id->subtype == sub && id->equip && (id->equip & EQP_AMMO)) {
-            if (id->elv == 0) {
-                if (id->weight < best_w) { best = it.first; best_w = id->weight; }
-            } else {
-                if (id->weight < fallback_w) { fallback = it.first; fallback_w = id->weight; }
-            }
-        }
-    }
-    return best != 0 ? best : fallback;
+	// Prefer lightest ammo with no level requirement so shells of any level can equip it
+	// and the weight-capped add-amount leaves enough room for equipping.
+	// If all matching ammo has a level gate, fall back to the lightest match.
+	t_itemid best = 0;
+	int best_w = INT_MAX;
+	t_itemid fallback = 0;
+	int fallback_w = INT_MAX;
+	for (const auto& it : item_db) {
+		std::shared_ptr<item_data> id = it.second;
+		if (!id || id->nameid == UNKNOWN_ITEM_ID)
+			continue;
+		if (id->type == IT_AMMO && id->subtype == sub && id->equip && (id->equip & EQP_AMMO)) {
+			if (id->elv == 0) {
+				if (id->weight < best_w) { best = it.first; best_w = id->weight; }
+			} else {
+				if (id->weight < fallback_w) { fallback = it.first; fallback_w = id->weight; }
+			}
+		}
+	}
+	return best != 0 ? best : fallback;
 }
 
 static t_itemid find_arrow_ammo_item() {
-    t_itemid id = find_ammo_item_by_subtype(AMMO_ARROW);
-    return id != 0 ? id : 1750; // Steel Arrow fallback
+	t_itemid id = find_ammo_item_by_subtype(AMMO_ARROW);
+	return id != 0 ? id : 1750; // Steel Arrow fallback
 }
 
 /// Derive weapon/shield sprites from inventory (status.weapon is weapon_type, not a sprite id).
 static void population_engine_sync_vd_weapon_shield(map_session_data* sd) {
-    if (sd == nullptr)
-        return;
-    pc_setinventorydata(*sd);
-    sd->update_look(LOOK_WEAPON);
-    sd->update_look(LOOK_SHIELD);
-    if (sd->equip_index[EQI_AMMO] >= 0 && sd->inventory_data[sd->equip_index[EQI_AMMO]] != nullptr) {
-        const item_data* ad = sd->inventory_data[sd->equip_index[EQI_AMMO]];
-        if (ad->type == IT_AMMO) {
-            const t_itemid look = ad->view_id != 0 ? ad->view_id : ad->nameid;
-            sd->vd.look[LOOK_SHIELD] = look;
-            sd->status.shield = look;
-        }
-    }
+	if (sd == nullptr)
+		return;
+	pc_setinventorydata(*sd);
+	sd->update_look(LOOK_WEAPON);
+	sd->update_look(LOOK_SHIELD);
+	if (sd->equip_index[EQI_AMMO] >= 0 && sd->inventory_data[sd->equip_index[EQI_AMMO]] != nullptr) {
+		const item_data* ad = sd->inventory_data[sd->equip_index[EQI_AMMO]];
+		if (ad->type == IT_AMMO) {
+			const t_itemid look = ad->view_id != 0 ? ad->view_id : ad->nameid;
+			sd->vd.look[LOOK_SHIELD] = look;
+			sd->status.shield = look;
+		}
+	}
 }
 
 // Helper: Find a valid equippable item by equipment type
 static uint16_t find_valid_equip_item(uint32 equip_type) {
-    // Iterate through actual item database instead of searching by ID
-    // This avoids checking thousands of non-existent items
-    for (const auto& it : item_db) {
-        t_itemid item_id = it.first;
-        std::shared_ptr<item_data> id = it.second;
-        
-        // Skip dummy items (UNKNOWN_ITEM_ID = 512)
-        if (!id || id->nameid == UNKNOWN_ITEM_ID)
-            continue;
-        
-        // Check if item matches the equipment type
-        if (id->equip && (id->equip & equip_type)) {
-            return (uint16_t)item_id;
-        }
-    }
-    
-    return 0; // No valid item found
+	// Iterate through actual item database instead of searching by ID
+	// This avoids checking thousands of non-existent items
+	for (const auto& it : item_db) {
+		t_itemid item_id = it.first;
+		std::shared_ptr<item_data> id = it.second;
+
+		// Skip dummy items (UNKNOWN_ITEM_ID = 512)
+		if (!id || id->nameid == UNKNOWN_ITEM_ID)
+			continue;
+
+		// Check if item matches the equipment type
+		if (id->equip && (id->equip & equip_type)) {
+			return (uint16_t)item_id;
+		}
+	}
+
+	return 0; // No valid item found
 }
 
-// Get appropriate weapon item ID for a job
-// Get base job class (1st class) from any job ID
+/**
+ * Resolve the first class of a job line (Knight -> Swordman, Rebellion -> Gunslinger).
+ * Novice-line jobs, including Super Novice, resolve to Novice.
+ * @param job_id: job to resolve
+ * @return first-class job ID, or JOB_NOVICE for an unknown job
+ */
 static uint16_t get_base_job(uint16_t job_id) {
-    // Map advanced jobs to their base 1st class
-    if (job_id == JOB_SWORDMAN || (job_id >= JOB_KNIGHT && job_id <= JOB_ROYAL_GUARD) ||
-        (job_id >= JOB_BABY_KNIGHT && job_id <= JOB_BABY_ROYAL_GUARD) ||
-        (job_id >= JOB_RUNE_KNIGHT && job_id <= JOB_RUNE_KNIGHT_T) ||
-        (job_id >= JOB_ROYAL_GUARD && job_id <= JOB_ROYAL_GUARD_T) ||
-        (job_id >= JOB_BABY_RUNE_KNIGHT && job_id <= JOB_BABY_ROYAL_GUARD) ||
-        (job_id >= JOB_DRAGON_KNIGHT && job_id <= JOB_IMPERIAL_GUARD)) {
-        return JOB_SWORDMAN;
-    }
-    if (job_id == JOB_MAGE || (job_id >= JOB_WIZARD && job_id <= JOB_SORCERER) ||
-        (job_id >= JOB_BABY_MAGE && job_id <= JOB_BABY_SORCERER) ||
-        (job_id >= JOB_WARLOCK && job_id <= JOB_WARLOCK_T) ||
-        (job_id >= JOB_SORCERER && job_id <= JOB_SORCERER_T) ||
-        (job_id >= JOB_BABY_WARLOCK && job_id <= JOB_BABY_SORCERER) ||
-        (job_id >= JOB_ARCH_MAGE && job_id <= JOB_ELEMENTAL_MASTER)) {
-        return JOB_MAGE;
-    }
-    if (job_id == JOB_ARCHER ||
-        (job_id >= JOB_HUNTER      && job_id <= JOB_RANGER) ||
-        (job_id >= JOB_BABY_ARCHER && job_id <= JOB_BABY_RANGER) ||
-        (job_id >= JOB_RANGER      && job_id <= JOB_RANGER_T) ||
-        job_id == JOB_BABY_RANGER ||
-        job_id == JOB_WINDHAWK) {
-        return JOB_ARCHER;
-    }
-    if (job_id == JOB_ACOLYTE || (job_id >= JOB_PRIEST && job_id <= JOB_CARDINAL) ||
-        (job_id >= JOB_BABY_ACOLYTE && job_id <= JOB_BABY_ARCH_BISHOP) ||
-        (job_id >= JOB_ARCH_BISHOP && job_id <= JOB_ARCH_BISHOP_T) ||
-        (job_id >= JOB_BABY_ARCH_BISHOP) ||
-        (job_id >= JOB_CARDINAL && job_id <= JOB_INQUISITOR)) {
-        return JOB_ACOLYTE;
-    }
-    if (job_id == JOB_MERCHANT || (job_id >= JOB_BLACKSMITH && job_id <= JOB_GENETIC) ||
-        (job_id >= JOB_BABY_MERCHANT && job_id <= JOB_BABY_GENETIC) ||
-        (job_id >= JOB_MECHANIC && job_id <= JOB_MECHANIC_T) ||
-        (job_id >= JOB_GENETIC && job_id <= JOB_GENETIC_T) ||
-        (job_id >= JOB_BABY_MECHANIC && job_id <= JOB_BABY_GENETIC) ||
-        (job_id >= JOB_MEISTER && job_id <= JOB_BIOLO)) {
-        return JOB_MERCHANT;
-    }
-    if (job_id == JOB_THIEF || (job_id >= JOB_ASSASSIN && job_id <= JOB_SHADOW_CHASER) ||
-        (job_id >= JOB_BABY_THIEF && job_id <= JOB_BABY_SHADOW_CHASER) ||
-        (job_id >= JOB_GUILLOTINE_CROSS && job_id <= JOB_GUILLOTINE_CROSS_T) ||
-        (job_id >= JOB_SHADOW_CHASER && job_id <= JOB_SHADOW_CHASER_T) ||
-        (job_id >= JOB_BABY_GUILLOTINE_CROSS && job_id <= JOB_BABY_SHADOW_CHASER) ||
-        (job_id >= JOB_SHADOW_CROSS && job_id <= JOB_ABYSS_CHASER)) {
-        return JOB_THIEF;
-    }
-    // Default to Novice for unknown jobs
-    return JOB_NOVICE;
+	if (!pcdb_checkid(job_id))
+		return JOB_NOVICE;
+
+	const int32 base_job = pc_mapid2jobid(pc_jobid2mapid(job_id) & MAPID_FIRSTMASK, SEX_MALE);
+
+	return base_job > 0 ? static_cast<uint16_t>(base_job) : JOB_NOVICE;
 }
 
 uint16_t population_engine_job_base_class(uint16_t job_id)
@@ -2963,489 +3212,494 @@ const PopulationEngine *population_engine_resolve_equipment(uint16_t job_id)
 }
 
 static uint16_t get_job_weapon(uint16_t job_id) {
-    // First, try to load from YAML equipment database (exact job match)
-    auto equipment = population_engine_find_any(job_id);
-    if (equipment && !equipment->weapon_pool.empty()) {
-        uint16_t picked = equipment->weapon_pool.size() == 1
-            ? equipment->weapon_pool[0]
-            : equipment->weapon_pool[rnd() % equipment->weapon_pool.size()];
-        if (picked > 0) {
-            struct item_data* id = itemdb_search(picked);
-            if (id && id->nameid != UNKNOWN_ITEM_ID)
-                return picked;
-        }
-    }
+	// First, try to load from YAML equipment database (exact job match)
+	auto equipment = population_engine_find_any(job_id);
+	if (equipment && !equipment->weapon_pool.empty()) {
+		uint16_t picked = equipment->weapon_pool.size() == 1
+			? equipment->weapon_pool[0]
+			: equipment->weapon_pool[rnd() % equipment->weapon_pool.size()];
+		if (picked > 0) {
+			struct item_data* id = itemdb_search(picked);
+			if (id && id->nameid != UNKNOWN_ITEM_ID)
+				return picked;
+		}
+	}
 
-    // Try base job class if exact match not found
-    uint16_t base_job = get_base_job(job_id);
-    if (base_job != job_id) {
-        equipment = population_engine_find_any(base_job);
-        if (equipment && !equipment->weapon_pool.empty()) {
-            uint16_t picked = equipment->weapon_pool.size() == 1
-                ? equipment->weapon_pool[0]
-                : equipment->weapon_pool[rnd() % equipment->weapon_pool.size()];
-            if (picked > 0) {
-                struct item_data* id = itemdb_search(picked);
-                if (id && id->nameid != UNKNOWN_ITEM_ID)
-                    return picked;
-            }
-        }
-    }
-    
-    // Fallback to old logic if YAML doesn't have this job
-    uint32 equip_type = 0;
-    
-    // Swordman line - Swords, Spears
-    if (job_id == JOB_SWORDMAN || job_id == JOB_KNIGHT || job_id == JOB_CRUSADER ||
-        job_id == JOB_LORD_KNIGHT || job_id == JOB_PALADIN || job_id == JOB_RUNE_KNIGHT ||
-        job_id == JOB_ROYAL_GUARD || job_id == JOB_BABY_KNIGHT || job_id == JOB_BABY_CRUSADER ||
-        job_id == JOB_BABY_RUNE_KNIGHT || job_id == JOB_BABY_ROYAL_GUARD) {
-        equip_type = EQP_HAND_R; // Try 1H or 2H weapons
-        uint16_t found = find_valid_equip_item(equip_type);
-        if (found) return found;
-        // Fallback to common IDs
-        uint16_t weapons[] = {1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109, 1110,
-                              1111, 1112, 1113, 1114, 1115, 1116, 1117, 1118, 1119, 1120,
-                              1301, 1302, 1303, 1304, 1305, 1306, 1307, 1308, 1309, 1310};
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Mage line - Staves
-    if (job_id == JOB_MAGE || job_id == JOB_WIZARD || job_id == JOB_SAGE ||
-        job_id == JOB_HIGH_WIZARD || job_id == JOB_PROFESSOR || job_id == JOB_WARLOCK ||
-        job_id == JOB_SORCERER || job_id == JOB_BABY_MAGE || job_id == JOB_BABY_WIZARD ||
-        job_id == JOB_BABY_SAGE || job_id == JOB_BABY_WARLOCK || job_id == JOB_BABY_SORCERER) {
-        equip_type = EQP_HAND_R;
-        uint16_t found = find_valid_equip_item(equip_type);
-        if (found) return found;
-        uint16_t weapons[] = {1601, 1602, 1603, 1604, 1605, 1606, 1607, 1608, 1609, 1610,
-                              1701, 1702, 1703, 1704, 1705, 1706, 1707, 1708, 1709, 1710};
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Archer line - Bows
-    if (job_id == JOB_ARCHER || job_id == JOB_HUNTER || job_id == JOB_SNIPER ||
-        job_id == JOB_RANGER || job_id == JOB_BABY_ARCHER || job_id == JOB_BABY_HUNTER ||
-        job_id == JOB_BABY_RANGER) {
-        equip_type = EQP_HAND_R;
-        uint16_t found = find_valid_equip_item(equip_type);
-        if (found) return found;
-        uint16_t weapons[] = {1701, 1702, 1703, 1704, 1705, 1706, 1707, 1708, 1709, 1710,
-                              1711, 1712, 1713, 1714, 1715, 1716, 1717, 1718, 1719, 1720};
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Acolyte line - Maces
-    if (job_id == JOB_ACOLYTE || job_id == JOB_PRIEST || job_id == JOB_MONK ||
-        job_id == JOB_HIGH_PRIEST || job_id == JOB_CHAMPION || job_id == JOB_ARCH_BISHOP ||
-        job_id == JOB_CARDINAL || job_id == JOB_BABY_ACOLYTE || job_id == JOB_BABY_PRIEST ||
-        job_id == JOB_BABY_MONK || job_id == JOB_BABY_ARCH_BISHOP) {
-        equip_type = EQP_HAND_R;
-        uint16_t found = find_valid_equip_item(equip_type);
-        if (found) return found;
-        uint16_t weapons[] = {1501, 1502, 1503, 1504, 1505, 1506, 1507, 1508, 1509, 1510,
-                              1511, 1512, 1513, 1514, 1515, 1516, 1517, 1518, 1519, 1520};
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Thief line - Daggers, Katars
-    if (job_id == JOB_THIEF || job_id == JOB_ASSASSIN || job_id == JOB_ROGUE ||
-        job_id == JOB_ASSASSIN_CROSS || job_id == JOB_STALKER || job_id == JOB_GUILLOTINE_CROSS ||
-        job_id == JOB_SHADOW_CHASER || job_id == JOB_BABY_THIEF || job_id == JOB_BABY_ASSASSIN ||
-        job_id == JOB_BABY_ROGUE || job_id == JOB_BABY_GUILLOTINE_CROSS || job_id == JOB_BABY_SHADOW_CHASER) {
-        equip_type = EQP_HAND_R;
-        uint16_t found = find_valid_equip_item(equip_type);
-        if (found) return found;
-        uint16_t weapons[] = {1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210,
-                              1251, 1252, 1253, 1254, 1255, 1256, 1257, 1258, 1259, 1260};
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Merchant line - Axes, Maces
-    if (job_id == JOB_MERCHANT || job_id == JOB_BLACKSMITH || job_id == JOB_ALCHEMIST ||
-        job_id == JOB_WHITESMITH || job_id == JOB_CREATOR || job_id == JOB_MECHANIC ||
-        job_id == JOB_GENETIC || job_id == JOB_BABY_MERCHANT || job_id == JOB_BABY_BLACKSMITH ||
-        job_id == JOB_BABY_ALCHEMIST || job_id == JOB_BABY_MECHANIC || job_id == JOB_BABY_GENETIC) {
-        equip_type = EQP_HAND_R;
-        uint16_t found = find_valid_equip_item(equip_type);
-        if (found) return found;
-        uint16_t weapons[] = {1401, 1402, 1403, 1404, 1405, 1406, 1407, 1408, 1409, 1410,
-                              1421, 1422, 1423, 1424, 1425, 1426, 1427, 1428, 1429, 1430};
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Bard/Dancer line - Musical/Whip
-    if (job_id == JOB_BARD || job_id == JOB_DANCER || job_id == JOB_CLOWN || job_id == JOB_GYPSY ||
-        job_id == JOB_MINSTREL || job_id == JOB_WANDERER || job_id == JOB_TROUBADOUR || job_id == JOB_TROUVERE ||
-        job_id == JOB_BABY_BARD || job_id == JOB_BABY_DANCER || job_id == JOB_BABY_MINSTREL || job_id == JOB_BABY_WANDERER) {
-        // Musical (Bard) or Whip (Dancer)
-        if (job_id == JOB_BARD || job_id == JOB_CLOWN || job_id == JOB_MINSTREL || job_id == JOB_TROUBADOUR ||
-            job_id == JOB_BABY_BARD || job_id == JOB_BABY_MINSTREL) {
-            uint16_t weapons[] = {1901, 1902, 1903, 1904, 1905, 1906, 1907, 1908, 1909, 1910}; // Musical
-            return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-        } else {
-            uint16_t weapons[] = {1801, 1802, 1803, 1804, 1805, 1806, 1807, 1808, 1809, 1810}; // Whip
-            return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-        }
-    }
-    
-    // Ninja line - Huuma
-    if (job_id == JOB_NINJA || job_id == JOB_KAGEROU || job_id == JOB_OBORO ||
-        job_id == JOB_BABY_NINJA || job_id == JOB_BABY_KAGEROU || job_id == JOB_BABY_OBORO) {
-        uint16_t weapons[] = {1951, 1952, 1953, 1954, 1955, 1956, 1957, 1958, 1959, 1960}; // Huuma
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Taekwon line - Knuckle
-    if (job_id == JOB_TAEKWON || job_id == JOB_STAR_GLADIATOR || job_id == JOB_SOUL_LINKER ||
-        job_id == JOB_BABY_TAEKWON || job_id == JOB_BABY_STAR_GLADIATOR || job_id == JOB_BABY_SOUL_LINKER) {
-        uint16_t weapons[] = {1851, 1852, 1853, 1854, 1855, 1856, 1857, 1858, 1859, 1860}; // Knuckle
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Gunslinger line - Revolver, Rifle, Gatling, Shotgun
-    if (job_id == JOB_GUNSLINGER || job_id == JOB_REBELLION || job_id == JOB_BABY_GUNSLINGER || job_id == JOB_BABY_REBELLION) {
-        uint16_t weapons[] = {13101, 13102, 13103, 13104, 13105, 13106, 13107, 13108, 13109, 13110, // Revolver
-                              13151, 13152, 13153, 13154, 13155, 13156, 13157, 13158, 13159, 13160, // Rifle
-                              13201, 13202, 13203, 13204, 13205, 13206, 13207, 13208, 13209, 13210, // Gatling
-                              13251, 13252, 13253, 13254, 13255, 13256, 13257, 13258, 13259, 13260}; // Shotgun
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Sura - Book
-    if (job_id == JOB_SURA || job_id == JOB_SURA_T || job_id == JOB_BABY_SURA) {
-        uint16_t weapons[] = {1901, 1902, 1903, 1904, 1905, 1906, 1907, 1908, 1909, 1910}; // Book
-        return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
-    }
-    
-    // Default: No weapon
-    return 0;
+	// Try base job class if exact match not found
+	uint16_t base_job = get_base_job(job_id);
+	if (base_job != job_id) {
+		equipment = population_engine_find_any(base_job);
+		if (equipment && !equipment->weapon_pool.empty()) {
+			uint16_t picked = equipment->weapon_pool.size() == 1
+				? equipment->weapon_pool[0]
+				: equipment->weapon_pool[rnd() % equipment->weapon_pool.size()];
+			if (picked > 0) {
+				struct item_data* id = itemdb_search(picked);
+				if (id && id->nameid != UNKNOWN_ITEM_ID)
+					return picked;
+			}
+		}
+	}
+
+	// Fallback to old logic if YAML doesn't have this job
+	uint32 equip_type = 0;
+
+	// Swordman line - Swords, Spears
+	if (job_id == JOB_SWORDMAN || job_id == JOB_KNIGHT || job_id == JOB_CRUSADER ||
+		job_id == JOB_LORD_KNIGHT || job_id == JOB_PALADIN || job_id == JOB_RUNE_KNIGHT ||
+		job_id == JOB_ROYAL_GUARD || job_id == JOB_BABY_KNIGHT || job_id == JOB_BABY_CRUSADER ||
+		job_id == JOB_BABY_RUNE_KNIGHT || job_id == JOB_BABY_ROYAL_GUARD) {
+		equip_type = EQP_HAND_R; // Try 1H or 2H weapons
+		uint16_t found = find_valid_equip_item(equip_type);
+		if (found) return found;
+		// Fallback to common IDs
+		uint16_t weapons[] = {1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1109, 1110,
+							  1111, 1112, 1113, 1114, 1115, 1116, 1117, 1118, 1119, 1120,
+							  1301, 1302, 1303, 1304, 1305, 1306, 1307, 1308, 1309, 1310};
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Mage line - Staves
+	if (job_id == JOB_MAGE || job_id == JOB_WIZARD || job_id == JOB_SAGE ||
+		job_id == JOB_HIGH_WIZARD || job_id == JOB_PROFESSOR || job_id == JOB_WARLOCK ||
+		job_id == JOB_SORCERER || job_id == JOB_BABY_MAGE || job_id == JOB_BABY_WIZARD ||
+		job_id == JOB_BABY_SAGE || job_id == JOB_BABY_WARLOCK || job_id == JOB_BABY_SORCERER) {
+		equip_type = EQP_HAND_R;
+		uint16_t found = find_valid_equip_item(equip_type);
+		if (found) return found;
+		uint16_t weapons[] = {1601, 1602, 1603, 1604, 1605, 1606, 1607, 1608, 1609, 1610,
+							  1701, 1702, 1703, 1704, 1705, 1706, 1707, 1708, 1709, 1710};
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Archer line - Bows
+	if (job_id == JOB_ARCHER || job_id == JOB_HUNTER || job_id == JOB_SNIPER ||
+		job_id == JOB_RANGER || job_id == JOB_BABY_ARCHER || job_id == JOB_BABY_HUNTER ||
+		job_id == JOB_BABY_RANGER) {
+		equip_type = EQP_HAND_R;
+		uint16_t found = find_valid_equip_item(equip_type);
+		if (found) return found;
+		uint16_t weapons[] = {1701, 1702, 1703, 1704, 1705, 1706, 1707, 1708, 1709, 1710,
+							  1711, 1712, 1713, 1714, 1715, 1716, 1717, 1718, 1719, 1720};
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Acolyte line - Maces
+	if (job_id == JOB_ACOLYTE || job_id == JOB_PRIEST || job_id == JOB_MONK ||
+		job_id == JOB_HIGH_PRIEST || job_id == JOB_CHAMPION || job_id == JOB_ARCH_BISHOP ||
+		job_id == JOB_CARDINAL || job_id == JOB_BABY_ACOLYTE || job_id == JOB_BABY_PRIEST ||
+		job_id == JOB_BABY_MONK || job_id == JOB_BABY_ARCH_BISHOP) {
+		equip_type = EQP_HAND_R;
+		uint16_t found = find_valid_equip_item(equip_type);
+		if (found) return found;
+		uint16_t weapons[] = {1501, 1502, 1503, 1504, 1505, 1506, 1507, 1508, 1509, 1510,
+							  1511, 1512, 1513, 1514, 1515, 1516, 1517, 1518, 1519, 1520};
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Thief line - Daggers, Katars
+	if (job_id == JOB_THIEF || job_id == JOB_ASSASSIN || job_id == JOB_ROGUE ||
+		job_id == JOB_ASSASSIN_CROSS || job_id == JOB_STALKER || job_id == JOB_GUILLOTINE_CROSS ||
+		job_id == JOB_SHADOW_CHASER || job_id == JOB_BABY_THIEF || job_id == JOB_BABY_ASSASSIN ||
+		job_id == JOB_BABY_ROGUE || job_id == JOB_BABY_GUILLOTINE_CROSS || job_id == JOB_BABY_SHADOW_CHASER) {
+		equip_type = EQP_HAND_R;
+		uint16_t found = find_valid_equip_item(equip_type);
+		if (found) return found;
+		uint16_t weapons[] = {1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210,
+							  1251, 1252, 1253, 1254, 1255, 1256, 1257, 1258, 1259, 1260};
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Merchant line - Axes, Maces
+	if (job_id == JOB_MERCHANT || job_id == JOB_BLACKSMITH || job_id == JOB_ALCHEMIST ||
+		job_id == JOB_WHITESMITH || job_id == JOB_CREATOR || job_id == JOB_MECHANIC ||
+		job_id == JOB_GENETIC || job_id == JOB_BABY_MERCHANT || job_id == JOB_BABY_BLACKSMITH ||
+		job_id == JOB_BABY_ALCHEMIST || job_id == JOB_BABY_MECHANIC || job_id == JOB_BABY_GENETIC) {
+		equip_type = EQP_HAND_R;
+		uint16_t found = find_valid_equip_item(equip_type);
+		if (found) return found;
+		uint16_t weapons[] = {1401, 1402, 1403, 1404, 1405, 1406, 1407, 1408, 1409, 1410,
+							  1421, 1422, 1423, 1424, 1425, 1426, 1427, 1428, 1429, 1430};
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Bard/Dancer line - Musical/Whip
+	if (job_id == JOB_BARD || job_id == JOB_DANCER || job_id == JOB_CLOWN || job_id == JOB_GYPSY ||
+		job_id == JOB_MINSTREL || job_id == JOB_WANDERER || job_id == JOB_TROUBADOUR || job_id == JOB_TROUVERE ||
+		job_id == JOB_BABY_BARD || job_id == JOB_BABY_DANCER || job_id == JOB_BABY_MINSTREL || job_id == JOB_BABY_WANDERER) {
+		// Musical (Bard) or Whip (Dancer)
+		if (job_id == JOB_BARD || job_id == JOB_CLOWN || job_id == JOB_MINSTREL || job_id == JOB_TROUBADOUR ||
+			job_id == JOB_BABY_BARD || job_id == JOB_BABY_MINSTREL) {
+			uint16_t weapons[] = {1901, 1902, 1903, 1904, 1905, 1906, 1907, 1908, 1909, 1910}; // Musical
+			return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+		} else {
+			uint16_t weapons[] = {1801, 1802, 1803, 1804, 1805, 1806, 1807, 1808, 1809, 1810}; // Whip
+			return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+		}
+	}
+
+	// Ninja line - Huuma
+	if (job_id == JOB_NINJA || job_id == JOB_KAGEROU || job_id == JOB_OBORO ||
+		job_id == JOB_BABY_NINJA || job_id == JOB_BABY_KAGEROU || job_id == JOB_BABY_OBORO) {
+		uint16_t weapons[] = {1951, 1952, 1953, 1954, 1955, 1956, 1957, 1958, 1959, 1960}; // Huuma
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Taekwon line - Knuckle
+	if (job_id == JOB_TAEKWON || job_id == JOB_STAR_GLADIATOR || job_id == JOB_SOUL_LINKER ||
+		job_id == JOB_BABY_TAEKWON || job_id == JOB_BABY_STAR_GLADIATOR || job_id == JOB_BABY_SOUL_LINKER) {
+		uint16_t weapons[] = {1851, 1852, 1853, 1854, 1855, 1856, 1857, 1858, 1859, 1860}; // Knuckle
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Gunslinger line - Revolver, Rifle, Gatling, Shotgun
+	if (job_id == JOB_GUNSLINGER || job_id == JOB_REBELLION || job_id == JOB_BABY_GUNSLINGER || job_id == JOB_BABY_REBELLION) {
+		uint16_t weapons[] = {13101, 13102, 13103, 13104, 13105, 13106, 13107, 13108, 13109, 13110, // Revolver
+							  13151, 13152, 13153, 13154, 13155, 13156, 13157, 13158, 13159, 13160, // Rifle
+							  13201, 13202, 13203, 13204, 13205, 13206, 13207, 13208, 13209, 13210, // Gatling
+							  13251, 13252, 13253, 13254, 13255, 13256, 13257, 13258, 13259, 13260}; // Shotgun
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Sura - Book
+	if (job_id == JOB_SURA || job_id == JOB_SURA_T || job_id == JOB_BABY_SURA) {
+		uint16_t weapons[] = {1901, 1902, 1903, 1904, 1905, 1906, 1907, 1908, 1909, 1910}; // Book
+		return weapons[rnd() % (sizeof(weapons) / sizeof(weapons[0]))];
+	}
+
+	// Default: No weapon
+	return 0;
 }
 
 // Get random headgear item ID
 static uint16_t get_random_headgear(uint8_t slot) {
-    uint32 equip_type = 0;
-    if (slot == 0) equip_type = EQP_HEAD_TOP;
-    else if (slot == 1) equip_type = EQP_HEAD_MID;
-    else if (slot == 2) equip_type = EQP_HEAD_LOW;
-    
-    // Try to find a valid item first
-    if (equip_type != 0) {
-        uint16_t found = find_valid_equip_item(equip_type);
-        if (found) return found;
-    }
-    
-    // Fallback: Common headgear item IDs (standard RO item IDs)
-    // Head Top (slot 0)
-    if (slot == 0) {
-        uint16_t headgears[] = {5001, 5002, 5003, 5004, 5005, 5006, 5007, 5008, 5009, 5010,
-                                5011, 5012, 5013, 5014, 5015, 5016, 5017, 5018, 5019, 5020,
-                                5021, 5022, 5023, 5024, 5025, 5026, 5027, 5028, 5029, 5030};
-        return headgears[rnd() % (sizeof(headgears) / sizeof(headgears[0]))];
-    }
-    // Head Mid (slot 1)
-    else if (slot == 1) {
-        uint16_t headgears[] = {5101, 5102, 5103, 5104, 5105, 5106, 5107, 5108, 5109, 5110,
-                                5111, 5112, 5113, 5114, 5115, 5116, 5117, 5118, 5119, 5120};
-        return headgears[rnd() % (sizeof(headgears) / sizeof(headgears[0]))];
-    }
-    // Head Bottom (slot 2)
-    else {
-        uint16_t headgears[] = {5201, 5202, 5203, 5204, 5205, 5206, 5207, 5208, 5209, 5210,
-                                5211, 5212, 5213, 5214, 5215, 5216, 5217, 5218, 5219, 5220};
-        return headgears[rnd() % (sizeof(headgears) / sizeof(headgears[0]))];
-    }
+	uint32 equip_type = 0;
+	if (slot == 0) equip_type = EQP_HEAD_TOP;
+	else if (slot == 1) equip_type = EQP_HEAD_MID;
+	else if (slot == 2) equip_type = EQP_HEAD_LOW;
+
+	// Try to find a valid item first
+	if (equip_type != 0) {
+		uint16_t found = find_valid_equip_item(equip_type);
+		if (found) return found;
+	}
+
+	// Fallback: Common headgear item IDs (standard RO item IDs)
+	// Head Top (slot 0)
+	if (slot == 0) {
+		uint16_t headgears[] = {5001, 5002, 5003, 5004, 5005, 5006, 5007, 5008, 5009, 5010,
+								5011, 5012, 5013, 5014, 5015, 5016, 5017, 5018, 5019, 5020,
+								5021, 5022, 5023, 5024, 5025, 5026, 5027, 5028, 5029, 5030};
+		return headgears[rnd() % (sizeof(headgears) / sizeof(headgears[0]))];
+	}
+	// Head Mid (slot 1)
+	else if (slot == 1) {
+		uint16_t headgears[] = {5101, 5102, 5103, 5104, 5105, 5106, 5107, 5108, 5109, 5110,
+								5111, 5112, 5113, 5114, 5115, 5116, 5117, 5118, 5119, 5120};
+		return headgears[rnd() % (sizeof(headgears) / sizeof(headgears[0]))];
+	}
+	// Head Bottom (slot 2)
+	else {
+		uint16_t headgears[] = {5201, 5202, 5203, 5204, 5205, 5206, 5207, 5208, 5209, 5210,
+								5211, 5212, 5213, 5214, 5215, 5216, 5217, 5218, 5219, 5220};
+		return headgears[rnd() % (sizeof(headgears) / sizeof(headgears[0]))];
+	}
 }
 
 // Get random costume/robe item ID
 static uint16_t get_random_costume_robe() {
-    // Try to find a valid robe/garment first
-    uint16_t found = find_valid_equip_item(EQP_GARMENT);
-    if (found) return found;
-    
-    // Fallback: Common costume/robe item IDs (standard RO item IDs)
-    uint16_t robes[] = {25001, 25002, 25003, 25004, 25005, 25006, 25007, 25008, 25009, 25010,
-                        25011, 25012, 25013, 25014, 25015, 25016, 25017, 25018, 25019, 25020};
-    return robes[rnd() % (sizeof(robes) / sizeof(robes[0]))];
+	// Try to find a valid robe/garment first
+	uint16_t found = find_valid_equip_item(EQP_GARMENT);
+	if (found) return found;
+
+	// Fallback: Common costume/robe item IDs (standard RO item IDs)
+	uint16_t robes[] = {25001, 25002, 25003, 25004, 25005, 25006, 25007, 25008, 25009, 25010,
+						25011, 25012, 25013, 25014, 25015, 25016, 25017, 25018, 25019, 25020};
+	return robes[rnd() % (sizeof(robes) / sizeof(robes[0]))];
 }
 
 bool population_engine_start(const PopulationEngineConfig& config, PopulationEngineStats& stats) {
-    int16_t map_id = config.map_id;
-    if (g_population_engine_running) {
-        ShowWarning("Population engine: Already running, stop it first\n");
-        return false;
-    }
-    struct map_data* mapdata = map_getmapdata(map_id);
-    if (!mapdata) {
-        ShowError("Population engine: Invalid map_id %d\n", map_id);
-        return false;
-    }
-    {
-        std::vector<map_session_data*> prev_shells = std::move(g_population_engine_pcs);
-        g_population_engine_count = 0;
-        g_next_population_engine_index.store(1);
-        population_engine_path_clear_all();
-        g_population_engine_stats = PopulationEngineStats();
-        g_current_config = config;
-        for (auto* prev_sd : prev_shells)
-            population_engine_shell_release(prev_sd);
-    }
+	int16_t map_id = config.map_id;
+	if (g_population_engine_running) {
+		ShowWarning("Population engine: Already running, stop it first\n");
+		return false;
+	}
+	struct map_data* mapdata = map_getmapdata(map_id);
+	if (!mapdata) {
+		ShowError("Population engine: Invalid map_id %d\n", map_id);
+		return false;
+	}
+	{
+		std::vector<map_session_data*> prev_shells = std::move(g_population_engine_pcs);
+		g_population_engine_count = 0;
+		g_next_population_engine_index.store(1);
+		population_engine_path_clear_all();
+		population_engine_shell_index_clear();
+		g_population_engine_stats = PopulationEngineStats();
+		g_current_config = config;
+		for (auto* prev_sd : prev_shells)
+			population_engine_shell_release(prev_sd);
+		population_engine_shell_index_clear();
+	}
 
-    mapdata = map_getmapdata(map_id);
-    if (!mapdata) {
-        ShowError("Population engine: Map %d no longer valid after shell cleanup.\n", map_id);
-        return false;
-    }
+	mapdata = map_getmapdata(map_id);
+	if (!mapdata) {
+		ShowError("Population engine: Map %d no longer valid after shell cleanup.\n", map_id);
+		return false;
+	}
 
-    std::vector<map_session_data*> new_shells;
-    uint32_t local_errors = 0;
+	std::vector<map_session_data*> new_shells;
+	uint32_t local_errors = 0;
 
-    // Check global population shell limit
-    extern struct Battle_Config battle_config;
-    size_t current_fake_count = g_population_engine_count.load();
-    uint32_t max_allowed = battle_config.population_engine_max_count;
-    uint32_t num_to_spawn = config.num_units;
-    
-    // Adjust num_to_spawn if it would exceed the global limit
-    if (current_fake_count + num_to_spawn > max_allowed) {
-        num_to_spawn = (current_fake_count < static_cast<size_t>(max_allowed)) ? static_cast<uint32_t>(static_cast<size_t>(max_allowed) - current_fake_count) : 0;
-        if (num_to_spawn < config.num_units) {
-            ShowWarning("Population engine: Requested %u players but only %u can be spawned (global limit: %u, current: %zu)\n",
-                config.num_units, num_to_spawn, max_allowed, current_fake_count);
-        }
-    }
-    
-    ShowStatus("Population engine: Spawning %u population PCs on map %d.\n", num_to_spawn, map_id);
-    
-    for (uint32_t i = 0; i < num_to_spawn; i++) {
-        // Check global limit before each spawn (may have changed during loop)
-        if (g_population_engine_count.load() >= max_allowed) {
-            break; // Reached global limit
-        }
-        // Find spawn position
-        int x = config.spawn_x;
-        int y = config.spawn_y;
-        
-        if (config.spread_units || x <= 0 || y <= 0) {
-            // Find a valid walkable position on map
-            int16_t search_x = 0, search_y = 0;
-            bool found_valid = false;
-            
-            if (mapdata->xs > 0 && mapdata->ys > 0) {
-                // Try multiple times to find a valid walkable cell
-                for (int attempts = 0; attempts < 50; attempts++) {
-                    // Try map_search_freecell first (finds walkable cells)
-                    if (map_search_freecell(nullptr, map_id, &search_x, &search_y, 
-                        std::min(20, (int)(mapdata->xs/2)), std::min(20, (int)(mapdata->ys/2)), 1)) {
-                        // Double-check it's walkable
-                        if (map_getcell(map_id, search_x, search_y, CELL_CHKPASS)) {
-                            x = search_x;
-                            y = search_y;
-                            found_valid = true;
-                            break;
-                        }
-                    }
-                    
-                    // Fallback: try random position and validate
-                    search_x = 50 + (rnd() % std::max(1, static_cast<int>(mapdata->xs - 100)));
-                    search_y = 50 + (rnd() % std::max(1, static_cast<int>(mapdata->ys - 100)));
-                    search_x = static_cast<int16_t>(std::max(0, std::min(static_cast<int>(search_x), static_cast<int>(mapdata->xs - 1))));
-                    search_y = static_cast<int16_t>(std::max(0, std::min(static_cast<int>(search_y), static_cast<int>(mapdata->ys - 1))));
-                    
-                    if (map_getcell(map_id, search_x, search_y, CELL_CHKPASS)) {
-                        x = search_x;
-                        y = search_y;
-                        found_valid = true;
-                        break;
-                    }
-                }
-                
-                if (!found_valid) {
-                    // Last resort: use a safe default position
-                    x = std::max(50, std::min(100, (int)(mapdata->xs / 2)));
-                    y = std::max(50, std::min(100, (int)(mapdata->ys / 2)));
-                }
-            } else {
-                // Fallback for maps without size info
-                x = 100 + (i % 20) * 5;
-                y = 100 + (i / 20) * 5;
-            }
-        } else {
-            // Validate provided coordinates - ensure they're walkable
-            x = std::max(0, std::min(x, (int)(mapdata->xs - 1)));
-            y = std::max(0, std::min(y, (int)(mapdata->ys - 1)));
-            
-            // If not walkable, try to find nearby walkable cell
-            if (!map_getcell(map_id, x, y, CELL_CHKPASS)) {
-                int16_t search_x = x, search_y = y;
-                if (!map_search_freecell(nullptr, map_id, &search_x, &search_y, 5, 5, 1)) {
-                    // If still can't find, use default
-                    x = std::max(50, std::min(100, (int)(mapdata->xs / 2)));
-                    y = std::max(50, std::min(100, (int)(mapdata->ys / 2)));
-                } else {
-                    x = search_x;
-                    y = search_y;
-                }
-            }
-        }
-        
-        // Random appearance - get a job with valid view data
-        uint16_t job_id = get_random_job_id();
-        
-        // Double-check the job has valid view data before spawning
-        if (!pcdb_checkid(job_id)) {
-            ShowWarning("Population engine: Job %d has no view data, skipping population shell %u", job_id, i);
-            g_population_engine_stats.errors++;
-            continue;
-        }
-        
-        // Use battle_config limits for hair/cloth customization (from client.conf); spawn may override from YAML
-        uint8_t hair_style = MAX_HAIR_STYLE; // Fixed to max (42)
-        uint16_t hair_color = rnd() % 131; // 0-600
-        // Try to load equipment from YAML first (exact job match)
-        PopulationDbSource pop_src = PopulationDbSource::Main;
-        auto equipment = population_engine_find_any(job_id, &pop_src);
+	// Check global population shell limit
+	extern struct Battle_Config battle_config;
+	size_t current_fake_count = g_population_engine_count.load();
+	uint32_t max_allowed = battle_config.population_engine_max_count;
+	uint32_t num_to_spawn = config.num_units;
 
-        // If not found, try base job class
-        if (!equipment) {
-            uint16_t base_job = get_base_job(job_id);
-            if (base_job != job_id) {
-                equipment = population_engine_find_any(base_job, &pop_src);
-            }
-        }
+	// Adjust num_to_spawn if it would exceed the global limit
+	if (current_fake_count + num_to_spawn > max_allowed) {
+		num_to_spawn = (current_fake_count < static_cast<size_t>(max_allowed)) ? static_cast<uint32_t>(static_cast<size_t>(max_allowed) - current_fake_count) : 0;
+		if (num_to_spawn < config.num_units) {
+			ShowWarning("Population engine: Requested %u players but only %u can be spawned (global limit: %u, current: %zu)\n",
+				config.num_units, num_to_spawn, max_allowed, current_fake_count);
+		}
+	}
 
-        // Gender: job-locked classes first; else optional YAML Sex on equipment row
-        char sex;
-        char required_sex = get_job_required_sex(job_id);
-        if (required_sex != '\0') {
-            sex = required_sex;
-        } else if (equipment && equipment->sex_override >= 0) {
-            sex = equipment->sex_override ? 'M' : 'F';
-        } else {
-            sex = (rnd() % 2) ? 'M' : 'F';
-        }
-        
-        uint16_t weapon, shield, head_top, head_mid, head_bottom, garment;
-        struct script_code* init_script = nullptr;
-        bool skip_arrow = false;
+	ShowStatus("Population engine: Spawning %u population PCs on map %d.\n", num_to_spawn, map_id);
 
-        auto pick_pool = [](const std::vector<uint16_t>& p) -> uint16_t {
-            if (p.empty()) return 0;
-            return p.size() == 1 ? p[0] : p[rnd() % p.size()];
-        };
+	for (uint32_t i = 0; i < num_to_spawn; i++) {
+		// Check global limit before each spawn (may have changed during loop)
+		if (g_population_engine_count.load() >= max_allowed) {
+			break; // Reached global limit
+		}
+		// Find spawn position
+		int x = config.spawn_x;
+		int y = config.spawn_y;
 
-        if (equipment) {
-            // Use YAML configuration
-            weapon      = pick_pool(equipment->weapon_pool);
-            shield      = pick_pool(equipment->shield_pool);
-            head_top    = pick_pool(equipment->head_top_pool);
-            head_mid    = pick_pool(equipment->head_mid_pool);
-            head_bottom = pick_pool(equipment->head_bottom_pool);
-            garment     = pick_pool(equipment->garment_pool);
-            init_script = equipment->script;
-            skip_arrow  = equipment->skip_arrow;
-        } else {
-            // Fallback to old random logic
-            weapon = get_job_weapon(job_id);  // Job-specific weapon
-            // Try to find a valid shield first
-            shield = find_valid_equip_item(EQP_SHIELD);
-            if (shield == 0) {
-                // Fallback: 50% chance for shield (basic shield ID 2101)
-                shield = (rnd() % 2 == 0) ? 2101 : 0;
-            }
-            head_top = (rnd() % 3 == 0) ? get_random_headgear(0) : 0; // 33% chance for head top
-            head_mid = (rnd() % 3 == 0) ? get_random_headgear(1) : 0; // 33% chance for head mid
-            head_bottom = (rnd() % 3 == 0) ? get_random_headgear(2) : 0; // 33% chance for head bottom
-            garment = (rnd() % 2 == 0) ? get_random_costume_robe() : 0; // 50% chance for random garment / robe look
-        }
-        
-        uint32_t option = 0;
-        // cloth_color 0-698 is a fallback before equipment YAML ClothesColor overrides it.
-        uint16_t cloth_color = static_cast<uint16_t>(rnd() % 699); // 0-698 fallback
+		if (config.spread_units || x <= 0 || y <= 0) {
+			// Find a valid walkable position on map
+			int16_t search_x = 0, search_y = 0;
+			bool found_valid = false;
 
-        // Collision-safe allocation from the 5 M ID pool.
-        uint32_t spawn_index = population_engine_allocate_index();
-        if (spawn_index == 0) {
-            local_errors++;
-            continue; // pool fully exhausted
-        }
-        const PopulationEngine* pop_cfg = equipment ? equipment.get() : nullptr;
-        map_session_data* sd = population_engine_spawn_shell(map_id, x, y, spawn_index, job_id, sex, hair_style,
-            hair_color, weapon, shield, head_top, head_mid, head_bottom, option, cloth_color, garment,
-            init_script, skip_arrow, pop_cfg, /*map_category=*/0, pop_src);
-        
-        if (sd) {
-            new_shells.push_back(sd);
-            g_population_engine_count++;
-        } else {
-            local_errors++;
-        }
-    }
+			if (mapdata->xs > 0 && mapdata->ys > 0) {
+				// Try multiple times to find a valid walkable cell
+				for (int attempts = 0; attempts < 50; attempts++) {
+					// Try map_search_freecell first (finds walkable cells)
+					if (map_search_freecell(nullptr, map_id, &search_x, &search_y,
+						std::min(20, (int)(mapdata->xs/2)), std::min(20, (int)(mapdata->ys/2)), 1)) {
+						// Double-check it's walkable
+						if (map_getcell(map_id, search_x, search_y, CELL_CHKPASS)) {
+							x = search_x;
+							y = search_y;
+							found_valid = true;
+							break;
+						}
+					}
 
-    for (auto* sd : new_shells) {
-        g_population_engine_pcs.push_back(sd);
-        g_population_engine_stats.total_created++;
-        g_population_engine_stats.active_units++;
-    }
-    g_population_engine_stats.errors += local_errors;
-    g_population_engine_stats.unit_ids.clear();
-    for (auto* sd : g_population_engine_pcs) {
-        if (sd) g_population_engine_stats.unit_ids.push_back(sd->id);
-    }
-    stats = g_population_engine_stats;
-    g_population_engine_running = true;
-    ShowStatus("Population engine: Created %u population PCs.\n", g_population_engine_stats.total_created);
-    return true;
+					// Fallback: try random position and validate
+					search_x = 50 + (rnd() % std::max(1, static_cast<int>(mapdata->xs - 100)));
+					search_y = 50 + (rnd() % std::max(1, static_cast<int>(mapdata->ys - 100)));
+					search_x = static_cast<int16_t>(std::max(0, std::min(static_cast<int>(search_x), static_cast<int>(mapdata->xs - 1))));
+					search_y = static_cast<int16_t>(std::max(0, std::min(static_cast<int>(search_y), static_cast<int>(mapdata->ys - 1))));
+
+					if (map_getcell(map_id, search_x, search_y, CELL_CHKPASS)) {
+						x = search_x;
+						y = search_y;
+						found_valid = true;
+						break;
+					}
+				}
+
+				if (!found_valid) {
+					// Last resort: use a safe default position
+					x = std::max(50, std::min(100, (int)(mapdata->xs / 2)));
+					y = std::max(50, std::min(100, (int)(mapdata->ys / 2)));
+				}
+			} else {
+				// Fallback for maps without size info
+				x = 100 + (i % 20) * 5;
+				y = 100 + (i / 20) * 5;
+			}
+		} else {
+			// Validate provided coordinates - ensure they're walkable
+			x = std::max(0, std::min(x, (int)(mapdata->xs - 1)));
+			y = std::max(0, std::min(y, (int)(mapdata->ys - 1)));
+
+			// If not walkable, try to find nearby walkable cell
+			if (!map_getcell(map_id, x, y, CELL_CHKPASS)) {
+				int16_t search_x = x, search_y = y;
+				if (!map_search_freecell(nullptr, map_id, &search_x, &search_y, 5, 5, 1)) {
+					// If still can't find, use default
+					x = std::max(50, std::min(100, (int)(mapdata->xs / 2)));
+					y = std::max(50, std::min(100, (int)(mapdata->ys / 2)));
+				} else {
+					x = search_x;
+					y = search_y;
+				}
+			}
+		}
+
+		// Random appearance - get a job with valid view data
+		uint16_t job_id = get_random_job_id();
+
+		// Double-check the job has valid view data before spawning
+		if (!pcdb_checkid(job_id)) {
+			ShowWarning("Population engine: Job %d has no view data, skipping population shell %u", job_id, i);
+			g_population_engine_stats.errors++;
+			continue;
+		}
+
+		// Use battle_config limits for hair/cloth customization (from client.conf); spawn may override from YAML
+		uint8_t hair_style = MAX_HAIR_STYLE; // Fixed to max (42)
+		uint16_t hair_color = rnd() % 131; // 0-600
+		// Try to load equipment from YAML first (exact job match)
+		PopulationDbSource pop_src = PopulationDbSource::Main;
+		auto equipment = population_engine_find_any(job_id, &pop_src);
+
+		// If not found, try base job class
+		if (!equipment) {
+			uint16_t base_job = get_base_job(job_id);
+			if (base_job != job_id) {
+				equipment = population_engine_find_any(base_job, &pop_src);
+			}
+		}
+
+		// Gender: job-locked classes first; else optional YAML Sex on equipment row
+		char sex;
+		char required_sex = get_job_required_sex(job_id);
+		if (required_sex != '\0') {
+			sex = required_sex;
+		} else if (equipment && equipment->sex_override >= 0) {
+			sex = equipment->sex_override ? 'M' : 'F';
+		} else {
+			sex = (rnd() % 2) ? 'M' : 'F';
+		}
+
+		uint16_t weapon, shield, head_top, head_mid, head_bottom, garment;
+		struct script_code* init_script = nullptr;
+		bool skip_arrow = false;
+
+		auto pick_pool = [](const std::vector<uint16_t>& p) -> uint16_t {
+			if (p.empty()) return 0;
+			return p.size() == 1 ? p[0] : p[rnd() % p.size()];
+		};
+
+		if (equipment) {
+			// Use YAML configuration
+			weapon      = pick_pool(equipment->weapon_pool);
+			shield      = pick_pool(equipment->shield_pool);
+			head_top    = pick_pool(equipment->head_top_pool);
+			head_mid    = pick_pool(equipment->head_mid_pool);
+			head_bottom = pick_pool(equipment->head_bottom_pool);
+			garment     = pick_pool(equipment->garment_pool);
+			init_script = equipment->script;
+			skip_arrow  = equipment->skip_arrow;
+		} else {
+			// Fallback to old random logic
+			weapon = get_job_weapon(job_id);  // Job-specific weapon
+			// Try to find a valid shield first
+			shield = find_valid_equip_item(EQP_SHIELD);
+			if (shield == 0) {
+				// Fallback: 50% chance for shield (basic shield ID 2101)
+				shield = (rnd() % 2 == 0) ? 2101 : 0;
+			}
+			head_top = (rnd() % 3 == 0) ? get_random_headgear(0) : 0; // 33% chance for head top
+			head_mid = (rnd() % 3 == 0) ? get_random_headgear(1) : 0; // 33% chance for head mid
+			head_bottom = (rnd() % 3 == 0) ? get_random_headgear(2) : 0; // 33% chance for head bottom
+			garment = (rnd() % 2 == 0) ? get_random_costume_robe() : 0; // 50% chance for random garment / robe look
+		}
+
+		uint32_t option = 0;
+		// cloth_color 0-698 is a fallback before equipment YAML ClothesColor overrides it.
+		uint16_t cloth_color = static_cast<uint16_t>(rnd() % 699); // 0-698 fallback
+
+		// Collision-safe allocation from the 5 M ID pool.
+		uint32_t spawn_index = population_engine_allocate_index();
+		if (spawn_index == 0) {
+			local_errors++;
+			continue; // pool fully exhausted
+		}
+		const PopulationEngine* pop_cfg = equipment ? equipment.get() : nullptr;
+		map_session_data* sd = population_engine_spawn_shell(map_id, x, y, spawn_index, job_id, sex, hair_style,
+			hair_color, weapon, shield, head_top, head_mid, head_bottom, option, cloth_color, garment,
+			init_script, skip_arrow, pop_cfg, /*map_category=*/0, pop_src);
+
+		if (sd) {
+			new_shells.push_back(sd);
+			g_population_engine_count++;
+		} else {
+			local_errors++;
+		}
+	}
+
+	for (auto* sd : new_shells) {
+		g_population_engine_pcs.push_back(sd);
+		population_engine_shell_index_add(sd);
+		g_population_engine_stats.total_created++;
+		g_population_engine_stats.active_units++;
+	}
+	g_population_engine_stats.errors += local_errors;
+	g_population_engine_stats.unit_ids.clear();
+	for (auto* sd : g_population_engine_pcs) {
+		if (sd) g_population_engine_stats.unit_ids.push_back(sd->id);
+	}
+	stats = g_population_engine_stats;
+	g_population_engine_running = true;
+	ShowStatus("Population engine: Created %u population PCs.\n", g_population_engine_stats.total_created);
+	return true;
 }
 
 void population_engine_stop() {
-    // Cancel all timers first so no stale timer fires after running=false is set
-    // or after a subsequent start() sets running=true again.
-    // Timer operations are main-thread-only and must not be done under the mutex.
-    if (g_autosummon_timer != INVALID_TIMER) {
-        const TimerData* td = get_timer(g_autosummon_timer);
-        if (td && td->func == population_engine_autosummon_timer)
-            delete_timer(g_autosummon_timer, population_engine_autosummon_timer);
-        g_autosummon_timer = INVALID_TIMER;
-    }
-    if (g_pop_chat_timer != INVALID_TIMER) {
-        const TimerData* td = get_timer(g_pop_chat_timer);
-        if (td && td->func == population_engine_chat_timer)
-            delete_timer(g_pop_chat_timer, population_engine_chat_timer);
-        g_pop_chat_timer = INVALID_TIMER;
-    }
-    if (g_population_combat_global_timer != INVALID_TIMER) {
-        const TimerData* tdc = get_timer(g_population_combat_global_timer);
-        if (tdc && tdc->func == population_engine_global_combat_timer)
-            delete_timer(g_population_combat_global_timer, population_engine_global_combat_timer);
-        g_population_combat_global_timer = INVALID_TIMER;
-    }
-    population_engine_path_stop_wander_timer();
+	// Cancel all timers first so no stale timer fires after running=false is set
+	// or after a subsequent start() sets running=true again.
+	// Timer operations are main-thread-only and must not be done under the mutex.
+	if (g_autosummon_timer != INVALID_TIMER) {
+		const TimerData* td = get_timer(g_autosummon_timer);
+		if (td && td->func == population_engine_autosummon_timer)
+			delete_timer(g_autosummon_timer, population_engine_autosummon_timer);
+		g_autosummon_timer = INVALID_TIMER;
+	}
+	if (g_pop_chat_timer != INVALID_TIMER) {
+		const TimerData* td = get_timer(g_pop_chat_timer);
+		if (td && td->func == population_engine_chat_timer)
+			delete_timer(g_pop_chat_timer, population_engine_chat_timer);
+		g_pop_chat_timer = INVALID_TIMER;
+	}
+	if (g_population_combat_global_timer != INVALID_TIMER) {
+		const TimerData* tdc = get_timer(g_population_combat_global_timer);
+		if (tdc && tdc->func == population_engine_global_combat_timer)
+			delete_timer(g_population_combat_global_timer, population_engine_global_combat_timer);
+		g_population_combat_global_timer = INVALID_TIMER;
+	}
+	population_engine_path_stop_wander_timer();
 
-    if (!g_population_engine_running && g_population_engine_pcs.empty())
-        return;
-    ShowStatus("Population engine: Stopping and cleaning up %zu population shells.\n", g_population_engine_pcs.size());
-    std::vector<map_session_data*> to_release = std::move(g_population_engine_pcs);
-    g_population_engine_count = 0;
-    g_next_population_engine_index.store(1);
-    g_population_engine_stats = PopulationEngineStats();
-    g_population_engine_running = false;
-    g_pop_chat_next_tick.clear();
-    population_engine_path_clear_all();
-    g_chat_cursor = 0;
-    for (map_session_data* sd : to_release)
-        population_engine_shell_release(sd);
-    population_engine_write_count_sql(0);
-    ShowStatus("Population engine: Stopped.\n");
+	if (!g_population_engine_running && g_population_engine_pcs.empty())
+		return;
+	ShowStatus("Population engine: Stopping and cleaning up %zu population shells.\n", g_population_engine_pcs.size());
+	std::vector<map_session_data*> to_release = std::move(g_population_engine_pcs);
+	g_population_engine_count = 0;
+	g_next_population_engine_index.store(1);
+	g_population_engine_stats = PopulationEngineStats();
+	g_population_engine_running = false;
+	g_pop_chat_next_tick.clear();
+	population_engine_path_clear_all();
+	population_engine_shell_index_clear();
+	g_chat_cursor = 0;
+	for (map_session_data* sd : to_release)
+		population_engine_shell_release(sd);
+	population_engine_shell_index_clear();
+	population_engine_write_count_sql(0);
+	ShowStatus("Population engine: Stopped.\n");
 }
 
 // Get statistics
 PopulationEngineStats population_engine_get_stats() {
-    return g_population_engine_stats;
+	return g_population_engine_stats;
 }
 
 bool population_engine_is_running() {
-    return g_population_engine_running;
+	return g_population_engine_running;
 }
 
 size_t population_engine_get_count() {
@@ -3506,50 +3760,11 @@ void population_engine_on_whisper_to_population_pc(map_session_data* from_sd, ma
 	if (!population_engine_is_population_pc(bot_sd->id))
 		return;
 
-	// Party request: if the player whispers a party-related keyword the shell accepts or
-	// creates a party and invites the player back (mirrors autocombat accept_party_request).
-	const bool has_msg = message[0] != '\0';
-	if (has_msg) {
-		const char* kw_party[]  = { "party", "pt", "join", "invite" };
-		bool is_party_request = false;
-		for (const char* kw : kw_party) {
-			if (stristr(message, kw) != nullptr) {
-				is_party_request = true;
-				break;
-			}
-		}
-		if (is_party_request) {
-			// Case A: the player is already in a party and invites the shell → accept immediately.
-			if (bot_sd->party_invite > 0 && bot_sd->party_invite_account == from_sd->status.account_id) {
-				party_add_member(bot_sd->party_invite, *bot_sd);
-				// Acknowledge via a whisper reply.
-				const std::vector<std::string>* accept_pool = population_chat_db().lines_for_category("party_invite_accept");
-				if (accept_pool && !accept_pool->empty()) {
-					const std::string& line = (*accept_pool)[rnd() % accept_pool->size()];
-					char buf[CHAT_SIZE_MAX];
-					population_engine_format_chat_line(bot_sd, line.c_str(), buf, sizeof(buf));
-					clif_wis_message(from_sd, bot_sd->status.name, buf, strlen(buf) + 1, pc_get_group_level(bot_sd));
-				}
-				return;
-			}
-			// Case B: shell has a party → invite the player.
-			if (bot_sd->status.party_id > 0 && bot_sd->status.party_id < 0x70000000) {
-				// Only real (char-server) parties can be extended.
-				party_invite(*bot_sd, from_sd);
-				return;
-			}
-			// Case C: nobody has a party → bot creates one and invites immediately after creation.
-			// Creating a real party requires char-server round-trip; instead enable accept_party_request
-			// so that when the player sends a formal invite the bot auto-accepts.
-			bot_sd->pop.accept_party_request = true;
-			// Hint to the player via whisper.
-			const std::vector<std::string>* pool = population_chat_db().lines_for_category("party_invite_accept");
-			if (pool && !pool->empty()) {
-				const std::string& line = (*pool)[rnd() % pool->size()];
-				char buf[CHAT_SIZE_MAX];
-				population_engine_format_chat_line(bot_sd, line.c_str(), buf, sizeof(buf));
-				clif_wis_message(from_sd, bot_sd->status.name, buf, strlen(buf) + 1, pc_get_group_level(bot_sd));
-			}
+	// Transient companions are owned by the real party leader through the NPC.
+	for (const char* keyword : {"party", "join", "invite"}) {
+		if (stristr(message, keyword)) {
+			const char* hint = "Visit the Companion Recruiter in Prontera (158,183) to choose your party companions.";
+			clif_wis_message(from_sd, bot_sd->status.name, hint, strlen(hint) + 1, pc_get_group_level(bot_sd));
 			return;
 		}
 	}
@@ -3586,6 +3801,10 @@ void population_engine_on_global_chat_mention(map_session_data* from_sd, const c
 }
 
 void do_final_population_engine() {
+	if (g_population_companion_timer != INVALID_TIMER) {
+		delete_timer(g_population_companion_timer, population_engine_companion_timer);
+		g_population_companion_timer = INVALID_TIMER;
+	}
 	// Stop first so shells are released while all DB shared_ptrs are still valid.
 	// Clearing the DBs before stop() would leave teardown code with null lookups.
 	population_engine_stop();
@@ -3610,8 +3829,8 @@ void do_final_population_engine() {
 /// Shells share fake party ID 0x71000000|map_id so they don't fight each other.
 /// Returns the number of shells actually spawned (0 on error).
 int population_engine_arena_start(const char* map_name, int shell_count,
-                                   int spawn_x, int spawn_y,
-                                   uint16_t job_override, int team_id)
+								   int spawn_x, int spawn_y,
+								   uint16_t job_override, int team_id)
 {
 	if (!map_name || shell_count <= 0 || shell_count > 25)
 		return 0;
@@ -3690,12 +3909,12 @@ int population_engine_arena_start(const char* map_name, int shell_count,
 	auto find_spawn_cell = [&](int cx, int cy, int &out_x, int &out_y) -> bool {
 		const int radius = 10;
 		if (cx > 0 && cy > 0
-		    && cx < mapdata->xs && cy < mapdata->ys) {
+			&& cx < mapdata->xs && cy < mapdata->ys) {
 			// map_search_freecell: when src=nullptr the initial *x/*y is the center.
 			int16_t sx = static_cast<int16_t>(cx);
 			int16_t sy = static_cast<int16_t>(cy);
 			if (map_search_freecell(nullptr, mid, &sx, &sy,
-			    static_cast<int16_t>(radius), static_cast<int16_t>(radius), 1)) {
+				static_cast<int16_t>(radius), static_cast<int16_t>(radius), 1)) {
 				out_x = sx;
 				out_y = sy;
 				return true;
@@ -3719,8 +3938,8 @@ int population_engine_arena_start(const char* map_name, int shell_count,
 		{
 			int16_t sx = 0, sy = 0;
 			if (map_search_freecell(nullptr, mid, &sx, &sy,
-			    static_cast<int16_t>(std::min(20, static_cast<int>(mapdata->xs / 2))),
-			    static_cast<int16_t>(std::min(20, static_cast<int>(mapdata->ys / 2))), 1)) {
+				static_cast<int16_t>(std::min(20, static_cast<int>(mapdata->xs / 2))),
+				static_cast<int16_t>(std::min(20, static_cast<int>(mapdata->ys / 2))), 1)) {
 				out_x = sx;
 				out_y = sy;
 				return true;
@@ -3819,6 +4038,7 @@ int population_engine_arena_start(const char* map_name, int shell_count,
 				| static_cast<uint32>(static_cast<uint16>(mid)));
 
 			g_population_engine_pcs.push_back(sd);
+			population_engine_shell_index_add(sd);
 			g_population_engine_count++;
 			g_population_engine_stats.total_created++;
 			g_population_engine_stats.active_units++;
@@ -3851,6 +4071,8 @@ void population_engine_arena_stop(const char* map_name)
 		});
 	const size_t removed = static_cast<size_t>(g_population_engine_pcs.end() - new_end);
 	g_population_engine_pcs.erase(new_end, g_population_engine_pcs.end());
+	if (removed > 0)
+		population_engine_shell_index_mark_dirty();
 	if (g_population_engine_count.load() >= removed)
 		g_population_engine_count -= removed;
 	else
@@ -3868,7 +4090,7 @@ void population_engine_arena_stop(const char* map_name)
 // -----------------------------------------------------------------------------
 std::vector<uint16_t> population_engine_arena_job_pool()
 {
-    return population_pvp_db().arena_job_pool();
+	return population_pvp_db().arena_job_pool();
 }
 
 // -----------------------------------------------------------------------------
@@ -3890,34 +4112,34 @@ std::vector<uint16_t> population_engine_arena_job_pool()
 // -----------------------------------------------------------------------------
 int population_engine_arena_relation(const block_list *s_bl, const block_list *t_bl)
 {
-    if (!s_bl || !t_bl)
-        return 0;
-    if (s_bl == t_bl)
-        return 0;
-    if (s_bl->m != t_bl->m)
-        return 0;
-    if (s_bl->type != BL_PC || t_bl->type != BL_PC)
-        return 0;
+	if (!s_bl || !t_bl)
+		return 0;
+	if (s_bl == t_bl)
+		return 0;
+	if (s_bl->m != t_bl->m)
+		return 0;
+	if (s_bl->type != BL_PC || t_bl->type != BL_PC)
+		return 0;
 
-    const map_session_data *s_sd = reinterpret_cast<const map_session_data*>(s_bl);
-    const map_session_data *t_sd = reinterpret_cast<const map_session_data*>(t_bl);
+	const map_session_data *s_sd = reinterpret_cast<const map_session_data*>(s_bl);
+	const map_session_data *t_sd = reinterpret_cast<const map_session_data*>(t_bl);
 
-    const int s_team = s_sd->pop.arena_team;
-    const int t_team = t_sd->pop.arena_team;
+	const int s_team = s_sd->pop.arena_team;
+	const int t_team = t_sd->pop.arena_team;
 
-    // Effective team: real players on a map that has any arena shell are
-    // implicitly team 2 (the player's side). For a relation to apply, at
-    // least one side must actually be a tagged arena shell — otherwise we
-    // have two real players and the engine has no opinion.
-    const bool s_is_shell = s_team > 0;
-    const bool t_is_shell = t_team > 0;
-    if (!s_is_shell && !t_is_shell)
-        return 0;
+	// Effective team: real players on a map that has any arena shell are
+	// implicitly team 2 (the player's side). For a relation to apply, at
+	// least one side must actually be a tagged arena shell — otherwise we
+	// have two real players and the engine has no opinion.
+	const bool s_is_shell = s_team > 0;
+	const bool t_is_shell = t_team > 0;
+	if (!s_is_shell && !t_is_shell)
+		return 0;
 
-    const int s_eff = s_is_shell ? s_team : 2;
-    const int t_eff = t_is_shell ? t_team : 2;
+	const int s_eff = s_is_shell ? s_team : 2;
+	const int t_eff = t_is_shell ? t_team : 2;
 
-    return (s_eff == t_eff) ? 1 : -1;
+	return (s_eff == t_eff) ? 1 : -1;
 }
 
 // PC-only convenience used by the population shell ally scan callbacks so a
@@ -3925,9 +4147,9 @@ int population_engine_arena_relation(const block_list *s_bl, const block_list *t
 // heal/buff target. Same logic as population_engine_arena_relation but bool.
 bool population_engine_arena_is_ally(const map_session_data *a, const map_session_data *b)
 {
-    if (!a || !b || a == b)
-        return false;
-    return population_engine_arena_relation(
-        reinterpret_cast<const block_list*>(a),
-        reinterpret_cast<const block_list*>(b)) > 0;
+	if (!a || !b || a == b)
+		return false;
+	return population_engine_arena_relation(
+		reinterpret_cast<const block_list*>(a),
+		reinterpret_cast<const block_list*>(b)) > 0;
 }

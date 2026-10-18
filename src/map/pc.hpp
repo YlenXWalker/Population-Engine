@@ -15,7 +15,7 @@
 #include <common/timer.hpp>
 
 #include "battleground.hpp"
-#include "population_engine/core/population_shell_state.hpp"
+#include "population_engine/population_shell.hpp"
 #include "buyingstore.hpp" // struct s_buyingstore
 #include "clif.hpp" //e_wip_block
 #include "itemdb.hpp" // MAX_ITEMGROUP

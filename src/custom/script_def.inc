@@ -19,3 +19,7 @@ BUILDIN_DEF(setkunai, "?"),
 BUILDIN_DEF(population_arena_start, "si????"),
 BUILDIN_DEF(population_arena_stop,  "s"),
 BUILDIN_DEF(population_arena_jobs,  ""),
+
+BUILDIN_DEF(population_companion_recruit, "i"),
+BUILDIN_DEF(population_companion_dismiss, ""),
+BUILDIN_DEF(population_hangout_spawn, "i"),

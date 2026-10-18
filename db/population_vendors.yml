@@ -324,3 +324,7 @@ Body:
   #   ItemFlags:
   #     AllowEquipment: false
   #     AllowCards: false
+
+Footer:
+  Imports:
+  - Path: db/import/population_vendors.yml

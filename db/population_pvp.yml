@@ -282,3 +282,50 @@ Body:
     TownBehavior: wander
     FieldBehavior: combat
     DungeonBehavior: combat
+
+  - Profile: third_jobs
+    Jobs:
+      RuneKnight: para_knight_base
+      RuneKnightT: para_knight_base
+      Warlock: para_mage
+      WarlockT: para_mage
+      Ranger: para_bow
+      RangerT: para_bow
+      ArchBishop: para_mage
+      ArchBishopT: para_mage
+      Mechanic: para_merchant
+      MechanicT: para_merchant
+      GuillotineCross: para_assassin_katar
+      GuillotineCrossT: para_assassin_katar
+      RoyalGuard: para_crusader
+      RoyalGuardT: para_crusader
+      Sorcerer: para_mage
+      SorcererT: para_mage
+      Minstrel: para_bow
+      MinstrelT: para_bow
+      Wanderer: para_bow
+      WandererT: para_bow
+      Sura: para_monk
+      SuraT: para_monk
+      Genetic: para_merchant
+      GeneticT: para_merchant
+      ShadowChaser: para_thief
+      ShadowChaserT: para_thief
+    NameProfile: default
+    ChatProfile: default
+    BaseLevel: [100, 120]
+    JobLevel: [20, 40]
+    Str: [40, 70]
+    Agi: [40, 70]
+    Vit: [40, 70]
+    Int: [40, 70]
+    Dex: [60, 90]
+    Luk: [20, 40]
+    Flags: [mortal, boss_avoid]
+    TownBehavior: wander
+    FieldBehavior: combat
+    DungeonBehavior: combat
+
+Footer:
+  Imports:
+  - Path: db/import/population_pvp.yml
