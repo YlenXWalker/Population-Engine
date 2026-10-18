@@ -2343,11 +2343,12 @@ static bool pe_shell_elemallowed(mob_data *md, int ele)
 	}
 
 	switch (ele) {
-	case ELE_GHOST:
-		return !((def_ele == ELE_NEUTRAL && ele_lv >= 2) || (def_ele == ELE_FIRE && ele_lv >= 3) ||
-				(def_ele == ELE_WATER && ele_lv >= 3) || (def_ele == ELE_WIND && ele_lv >= 3) ||
-				(def_ele == ELE_EARTH && ele_lv >= 3) || (def_ele == ELE_POISON && ele_lv >= 3) ||
-				(def_ele == ELE_HOLY && ele_lv >= 2) || (def_ele == ELE_DARK && ele_lv >= 2));
+	case ELE_GHOST: {
+		const bool blocks_from_level_two = def_ele == ELE_NEUTRAL || def_ele == ELE_HOLY || def_ele == ELE_DARK;
+		const bool blocks_from_level_three = def_ele == ELE_FIRE || def_ele == ELE_WATER ||
+			def_ele == ELE_WIND || def_ele == ELE_EARTH || def_ele == ELE_POISON;
+		return !((blocks_from_level_two && ele_lv >= 2) || (blocks_from_level_three && ele_lv >= 3));
+	}
 	case ELE_FIRE:
 	case ELE_WATER:
 	case ELE_WIND:
@@ -2365,10 +2366,13 @@ static bool pe_shell_elemallowed(mob_data *md, int ele)
 		return !((def_ele == ELE_WATER && ele_lv >= 3) || (def_ele == ELE_GHOST && ele_lv >= 3) ||
 				(def_ele == ELE_POISON) || (def_ele == ELE_UNDEAD) || (def_ele == ELE_HOLY && ele_lv >= 2) ||
 				(def_ele == ELE_DARK));
-	case ELE_UNDEAD:
-		return !((def_ele == ELE_WATER && ele_lv >= 3) || (def_ele == ELE_FIRE && ele_lv >= 3) ||
-				(def_ele == ELE_WIND && ele_lv >= 3) || (def_ele == ELE_EARTH && ele_lv >= 3) ||
-				(def_ele == ELE_POISON && ele_lv >= 1) || (def_ele == ELE_UNDEAD) || (def_ele == ELE_DARK));
+	case ELE_UNDEAD: {
+		const bool always_blocks = def_ele == ELE_UNDEAD || def_ele == ELE_DARK;
+		const bool blocks_from_level_three = def_ele == ELE_WATER || def_ele == ELE_FIRE ||
+			def_ele == ELE_WIND || def_ele == ELE_EARTH;
+		return !(always_blocks || (def_ele == ELE_POISON && ele_lv >= 1) ||
+			(blocks_from_level_three && ele_lv >= 3));
+	}
 	case ELE_NEUTRAL:
 		return !(def_ele == ELE_GHOST && ele_lv >= 2);
 	default:

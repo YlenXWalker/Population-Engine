@@ -2110,6 +2110,10 @@ const std::string PopulationSpawnDatabase::getDefaultLocation()
 
 uint64 PopulationSpawnDatabase::parseBodyNode(const ryml::NodeRef& node)
 {
+	// A Profile identifies both a new spawn entry and an import override. Omitted
+	// fields retain existing values; a new entry starts with empty lists and zero caps.
+	// Supplied map lists and Posts replace their previous contents, while supplied
+	// population and per-map limits are clamped to zero when negative.
 	std::string profile_name;
 	if (!this->asString(node, "Profile", profile_name) || profile_name.empty())
 		return 0;
@@ -2120,6 +2124,7 @@ uint64 PopulationSpawnDatabase::parseBodyNode(const ryml::NodeRef& node)
 		entry = std::make_shared<PopulationSpawnEntry>();
 	entry->profile_name = profile_name;
 	if (this->nodeExists(node, "Posts")) {
+		// Fixed hangout posts require a sequence; skip individual posts with invalid coordinates.
 		entry->posts.clear();
 		const auto& posts = node[c4::to_csubstr("Posts")];
 		if (!posts.is_seq()) { this->invalidWarning(posts, "Posts must be a sequence.\n"); return 0; }
