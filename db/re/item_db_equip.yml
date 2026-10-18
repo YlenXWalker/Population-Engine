@@ -32084,7 +32084,7 @@ Body:
     Name: Flame Manteau of Naght Sieger
     Type: Armor
     Buy: 20
-    Weight: 700
+    Weight: 500
     Defense: 16
     Slots: 1
     Jobs:
@@ -169359,8 +169359,6 @@ Body:
     EquipLevelMin: 1
     Refineable: true
     View: 548
-    Trade:
-      NoDrop: true
     Script: |
       if (getrefine()>6) {
          bonus bCritical,10;
@@ -173438,7 +173436,7 @@ Body:
     Weight: 300
     Defense: 20
     Slots: 1
-    Job:
+    Jobs:
       Crusader: true
       Knight: true
       Swordman: true
@@ -173471,7 +173469,7 @@ Body:
     Weight: 300
     Defense: 20
     Slots: 1
-    Job:
+    Jobs:
       Crusader: true
       Knight: true
       Swordman: true
@@ -185083,7 +185081,7 @@ Body:
     Type: Armor
     Locations:
       Costume_Head_Mid: true
-    Trage:
+    Trade:
       NoMail: true
       NoAuction: true
       NoGuildStorage: true
@@ -185139,7 +185137,7 @@ Body:
     Type: Armor
     Locations:
       Costume_Head_Mid: true
-    Trage:
+    Trade:
       NoDrop: true
       NoSell: true
       NoMail: true

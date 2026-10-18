@@ -1794,9 +1794,7 @@
     <ClCompile Include="skills/acolyte/silentium.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/acolyte/skill_factory_acolyte.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/acolyte/skill_factory_acolyte.cpp" />
     <ClCompile Include="skills/acolyte/skynetblow.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -2127,9 +2125,7 @@
     <ClCompile Include="skills/archer/skidtrap.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/archer/skill_factory_archer.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/archer/skill_factory_archer.cpp" />
     <ClCompile Include="skills/archer/skilledspecialsinger.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -2226,9 +2222,7 @@
     <ClCompile Include="skills/archer/winkofcharm.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/custom/skill_factory_custom.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/custom/skill_factory_custom.cpp" />
     <ClCompile Include="skills/elemental/ageofice.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -2325,9 +2319,7 @@
     <ClCompile Include="skills/elemental/rocklauncher.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/elemental/skill_factory_elemental.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/elemental/skill_factory_elemental.cpp" />
     <ClCompile Include="skills/elemental/solidskin.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -2499,9 +2491,7 @@
     <ClCompile Include="skills/gunslinger/shatterstorm.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/gunslinger/skill_factory_gunslinger.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/gunslinger/skill_factory_gunslinger.cpp" />
     <ClCompile Include="skills/gunslinger/slugshot.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -2661,9 +2651,7 @@
     <ClCompile Include="skills/homunculus/homunculus_xenoslasher.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/homunculus/skill_factory_homunculus.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/homunculus/skill_factory_homunculus.cpp" />
     <ClCompile Include="skills/mage/activityburn.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -2964,9 +2952,7 @@
     <ClCompile Include="skills/mage/sightrasher.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/mage/skill_factory_mage.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/mage/skill_factory_mage.cpp" />
     <ClCompile Include="skills/mage/soulexhale.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -3204,9 +3190,7 @@
     <ClCompile Include="skills/mercenary/mercenary_tender.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/mercenary/skill_factory_mercenary.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/mercenary/skill_factory_mercenary.cpp" />
     <ClCompile Include="skills/merchant/abrbattlewarior.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -3450,9 +3434,7 @@
     <ClCompile Include="skills/merchant/selfdestruction.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/merchant/skill_factory_merchant.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/merchant/skill_factory_merchant.cpp" />
     <ClCompile Include="skills/merchant/skill_vending.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -3687,9 +3669,7 @@
     <ClCompile Include="skills/ninja/shadowwarrior.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/ninja/skill_factory_ninja.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/ninja/skill_factory_ninja.cpp" />
     <ClCompile Include="skills/ninja/soulcutter.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -3759,9 +3739,7 @@
     <ClCompile Include="skills/novice/shieldchainrush.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/novice/skill_factory_novice.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/novice/skill_factory_novice.cpp" />
     <ClCompile Include="skills/novice/spiralpiercemax.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -4089,9 +4067,7 @@
     <ClCompile Include="skills/npc/silenceattack.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/npc/skill_factory_npc.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/npc/skill_factory_npc.cpp" />
     <ClCompile Include="skills/npc/sleepattack.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -4341,9 +4317,7 @@
     <ClCompile Include="skills/other/sequoiadust.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/other/skill_factory_other.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/other/skill_factory_other.cpp" />
     <ClCompile Include="skills/other/snowflip.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -4353,12 +4327,8 @@
     <ClCompile Include="skills/other/weaponenchantment.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/skill_factory.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
-    <ClCompile Include="skills/skill_impl.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/skill_factory.cpp" />
+    <ClCompile Include="skills/skill_impl.cpp" />
     <ClCompile Include="skills/summoner/bite.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -4452,9 +4422,7 @@
     <ClCompile Include="skills/summoner/silvervinestemspear.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/summoner/skill_factory_summoner.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/summoner/skill_factory_summoner.cpp" />
     <ClCompile Include="skills/summoner/spiritofsavage.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -4668,9 +4636,7 @@
     <ClCompile Include="skills/swordman/shieldspell.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/swordman/skill_factory_swordman.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/swordman/skill_factory_swordman.cpp" />
     <ClCompile Include="skills/swordman/smite.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -4848,9 +4814,7 @@
     <ClCompile Include="skills/taekwon/shadowssoul.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/taekwon/skill_factory_taekwon.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/taekwon/skill_factory_taekwon.cpp" />
     <ClCompile Include="skills/taekwon/skymoon.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
@@ -5223,9 +5187,7 @@
     <ClCompile Include="skills/thief/sightlessmind.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="skills/thief/skill_factory_thief.cpp">
-      <ExcludedFromBuild>true</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="skills/thief/skill_factory_thief.cpp" />
     <ClCompile Include="skills/thief/snatch.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>

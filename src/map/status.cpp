@@ -3885,6 +3885,7 @@ int32 status_calc_pc_sub(map_session_data* sd, uint8 opt)
 	sd->itemsphealrate.clear();
 	sd->itemgroupsphealrate.clear();
 
+	sd->hp_loss.clear();
 	sd->sp_loss.clear();
 	sd->hp_regen.clear();
 	sd->sp_regen.clear();
@@ -12875,10 +12876,6 @@ static bool status_change_start_post_delay(block_list* src, block_list* bl, sc_t
 		case SC_POTENT_VENOM:
 			val2 = 2 * val1;// Res Pierce Percentage
 			break;
-		case SC_A_MACHINE:
-			val4 = tick / 1000;
-			tick_time = 1000;
-			break;
 		case SC_D_MACHINE:
 			val2 = 200 + 50 * val1;// DEF Increase
 			val3 = 20 * val1;// Res Increase
@@ -15158,13 +15155,6 @@ TIMER_FUNC(status_change_timer){
 		}
 		break;
 
-	case SC_A_MACHINE:
-		if (--(sce->val4) >= 0) {
-			skill_castend_nodamage_id(bl, bl, MT_A_MACHINE, sce->val1, tick, 1);
-			sc_timer_next(1000 + tick);
-			return 0;
-		}
-		break;
 	case SC_SERVANTWEAPON:
 		if (sce->val4 >= 0) {
 			if( sd && sd->servantball < MAX_SERVANTBALL ){
