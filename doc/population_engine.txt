@@ -1,0 +1,900 @@
+//===== rAthena Documentation ================================
+//= Population Engine
+//===== By: ==================================================
+//= Louis T Steinhil
+//===== Last Updated: ========================================
+//= 20261014
+//===== Description: =========================================
+//= Server-run "shells": simulated player characters that
+//= walk, chat, hunt monsters, run vending shops and fight
+//= in arenas. Configured by battle settings and YAML
+//= databases; nothing about them is saved.
+//============================================================
+
+A shell is a complete player session (map_session_data) that the map-server
+creates by itself, without a client or a char-server login. Other players see
+and target it like any character. Shells are created by the autosummon timer
+from db/population_spawn.yml, by @populate and by population_arena_start.
+Their equipment, stats, skills, names and chat come from the population_*
+databases.
+
+---------------------------------------
+1. Files
+---------------------------------------
+
+src/map/population_engine.hpp, .cpp     - Public API, spawning, timers, chat,
+                                          vending, arena
+src/map/population_engine/              - Compiled as part of
+                                          population_engine.cpp (#include)
+  population_shell.hpp                  - Per-shell state (sd->pop), AI flags
+  population_config.hpp, .cpp           - YAML databases
+  population_combat.hpp, .cpp           - Combat AI, skill rotation, ammo
+  population_runtime.hpp, .cpp          - Targeting, movement, wander timer
+  population_expanded_ai.hpp, .cpp      - Condition trees (4.2)
+  population_diagnostics.hpp, .cpp      - Timing shown by @populate timing
+src/custom/script.inc, script_def.inc   - Script commands (6.)
+src/custom/atcommand.inc                - GM commands (7.)
+src/custom/battle_config_*.inc          - Battle settings (3.)
+conf/battle/population_engine.conf      - Battle settings, imported by
+                                          conf/battle_athena.conf
+db/population_engine.yml                - Job entries: towns, fields, dungeons
+db/population_pvp.yml                   - Job entries: arenas
+db/population_vendor_pop.yml            - Job entries: vendor shells
+db/population_gear_sets.yml             - Shared gear sets
+db/population_skill_db.yml              - Skill rotations per job
+db/population_spawn.yml                 - Autosummon map lists
+db/population_vendors.yml               - Vending stock and placement
+db/population_names.yml                 - Name generation
+db/population_chat.yml                  - Chat lines
+db/import-tmpl/population_*.yml         - Import templates for db/import/
+npc/custom/population/arena.txt         - Arena Manager NPC (Morocc)
+sql-files/population_engine/population_engine.sql
+                                        - Live shell count table
+
+---------------------------------------
+2. Installation
+---------------------------------------
+
+1. Import sql-files/population_engine/population_engine.sql into the main
+   database. It creates `cp_population_stats`, a single row with the live
+   shell count, which the control panel's server status page shows (the
+   control panel migrations create the same table). Without the table the
+   map-server prints an SQL error each time the count changes. The script is
+   safe to re-run.
+2. conf/battle_athena.conf imports conf/battle/population_engine.conf.
+   Keys that are missing use the built-in defaults (3.).
+3. Put local database changes in db/import/population_*.yml; they are read
+   after the files in db/.
+4. Add entries to db/population_spawn.yml (or its import). The shipped file
+   has none, so autosummon spawns nothing until at least one Profile is
+   listed (4.3). Vendor shells also need db/population_vendors.yml and
+   db/population_vendor_pop.yml entries; the shipped examples are commented
+   out (4.4).
+5. Optional: enable npc/custom/population/arena.txt in
+   npc/scripts_custom.conf (it is commented out) and set its map and
+   coordinates in OnInit.
+6. Restart the map-server. The engine starts by itself after the item and
+   job databases are loaded.
+
+---------------------------------------
+3. Settings (conf/battle/population_engine.conf)
+---------------------------------------
+
+The value in parentheses is the built-in default, used when the key is
+missing; "shipped" is the value in the file when it differs. Times are in
+milliseconds, distances in cells.
+
+@reloadbattleconf re-reads the file, but the combat, wander and chat timers
+are created once, when the map-server starts. Changing their intervals, or
+turning wander or chat on when it was off at start, needs a restart.
+Turning them off works at once.
+
+Limits and spawning
+
+population_engine_max_count: <1-30000> (1000, shipped 5000)
+    Most shells that may exist. Autosummon and @populate stop at this
+    number. Arena shells are counted but not limited by it.
+
+population_engine_autosummon_batch_size: <0-5000> (50, shipped 100)
+    Most shells the autosummon timer spawns in one run (it runs every 10
+    seconds). 0: no limit.
+
+population_engine_equipment_strict_load: <on/off> (off)
+    off: invalid items and values in a job database are dropped with a
+    warning and the rest loads. on: when a job database file
+    (population_engine, population_pvp, population_vendor_pop) had any
+    validation error, all of its job entries are discarded.
+
+population_engine_name_bot_fallback: <on/off> (off)
+    Name used by the bot_index strategy and when 32 generated names were
+    rejected (4.5). off: a syllable name from a built-in table. on:
+    Bot_<index>.
+
+population_engine_hat_effect: <number> (0)
+    Hat effect shown on every shell while it exists. Only IDs between
+    HAT_EF_MIN and HAT_EF_MAX (exclusive) are sent; 0 sends none. Needs
+    PACKETVER 2015-05-07 (main), 2015-04-29 (RE) or a Zero client.
+
+Combat AI
+
+population_engine_ai: <0x000-0x3FF> (0x1FF, shipped 0x3D2)
+    Bitmask:
+    0x002 Target switch: change to a monster that is more than 3 cells
+          closer than the current one (1 cell for Role: attacker).
+    0x010 Flee: below 30% HP, shells other than Role: tank cast their
+          self-buffs and step 5 cells away from the target; below 15% they
+          drop the target.
+    0x040 Pack: a shell that takes a new target passes it to idle combat
+          and guard shells within population_engine_shell_mdetection_cells.
+    0x080 Kite: shells whose longest attack skill reaches 4 cells or more
+          stop approaching once the target is in that range.
+    0x100 Combo: a skill gated on enemy_status (or on a condition tree)
+          that is satisfied right now is tried before the rotation.
+    0x200 Boss avoidance: shells other than Role: tank drop MVP targets.
+    0x001, 0x004, 0x008 and 0x020 are accepted but have no effect.
+
+population_engine_shell_timer_ms: <10-60000> (100)
+    Interval of the combat timer. A run processes the shells in a combat
+    session that are within AREA_SIZE + 4 cells of a real player; shells
+    far from players do not run the combat AI.
+
+population_engine_shell_attackskill: <on/off> (on)
+    off: shells use no offensive or ally-targeted skills; they only
+    basic-attack.
+
+population_engine_shell_basic_attack_chance: <0-100> (30, shipped 70)
+    Chance per combat tick to basic-attack instead of choosing a skill.
+    Not used for shells with Flags: skill_only.
+
+population_engine_shell_skill_interval_ms: <0-60000> (200, shipped 100)
+    Wait between two self-buff passes, and the skill delay after a cast
+    made in reaction to damage or while fleeing.
+
+population_engine_shell_attack_skill_delay_ms: <0-60000> (100)
+    Shortest wait after an offensive skill: the next skill waits for the
+    cast time plus the skill's own delay, or plus this value when the
+    skill's delay is shorter. 0: the skill's own delay.
+
+population_engine_shell_skill_min_sp_pct: <0-99> (15)
+    A skill is not chosen when its SP cost would leave less than this
+    percentage of max SP. 0: no reserve.
+
+population_engine_shell_sticky_target_ms: <0-60000> (2000)
+    After taking a target, a shell that looks for a new one first takes the
+    previous target again for this long, while it is still valid. 0: off.
+
+population_engine_shell_skill_los_check: <on/off> (on)
+    on: no skill is chosen against a target behind a wall.
+
+population_engine_shell_skill_strict_gate: <on/off> (on)
+    on: a skill is chosen only when status_check_skilluse allows it
+    (silence, sleep, sitting and similar).
+
+population_engine_shell_move_min: <0-500> (7)
+population_engine_shell_move_max: <0-500> (20)
+    Length of a roam step while a combat shell searches for monsters,
+    capped by max_walk_path. 0 uses 7 and 20.
+
+population_engine_path_attempts: <1-256> (16)
+    Cells tried for a forward roam step (in the facing direction first,
+    with a wall-free line) before shorter steps are tried.
+
+population_engine_shell_mdetection_cells: <1-100> (30)
+    Monster detection radius. The nearest-monster search uses at most 30
+    cells; the monster tracker scans twice the radius (at most 60).
+
+population_engine_shell_mobtracker_interval_ms: <100-600000> (200,
+shipped 500)
+    Interval between two monster tracker scans of a shell. The tracker
+    feeds target switching, several skill conditions and the roam
+    direction.
+
+population_engine_shell_detection_cache_ms: <0-600000> (300, shipped 500)
+    The result of a target search is reused for this long while the shell
+    has not moved.
+
+population_engine_shell_movement_owner_sm: <on/off> (on)
+    on: one movement order per shell per tick; a combat move replaces a
+    roam move. off: every movement request is carried out.
+
+Wander
+
+population_engine_wander_enable: <on/off> (on)
+population_engine_wander_tick_ms: <200-600000> (500)
+population_engine_wander_max_per_tick: <1-500> (50)
+    The wander timer gives up to max_per_tick shells a random walk step
+    per run. A run examines at most max(20 x max_per_tick, 200) shells and
+    the next run continues where it stopped.
+
+population_engine_wander_radius: <1-50> (12)
+    Longest step, also capped at max_walk_path - 5.
+
+population_engine_wander_cooldown_ms: <0-600000> (2000, shipped 1000)
+population_engine_wander_cooldown_jitter_ms: <0-600000> (1500, shipped
+1000)
+    Wait between two steps of a shell, plus a random 0..jitter. A new shell
+    takes its first step after a random 0..jitter. A failed step is
+    retried after 500 ms.
+
+Chat
+
+population_engine_chat_enable: <on/off> (off, shipped on)
+    Switch for ambient lines, replies and kill lines.
+
+population_engine_chat_tick_ms: <500-600000> (1500)
+population_engine_chat_max_per_tick: <0-500> (10)
+    The chat timer lets up to max_per_tick shells say a line per run,
+    going round all shells.
+
+population_engine_chat_cooldown_ms: <1000-3600000> (15000)
+population_engine_chat_cooldown_jitter_ms: <0-600000> (5000)
+    Wait between two lines of one shell, plus a random 0..jitter. A new
+    shell says its first line after a random 0..jitter.
+
+population_engine_chat_reply_enable: <on/off> (on)
+    Replies to whispers and to map chat that contains a shell's name.
+
+Behaviour
+
+population_engine_daily_cycle: <on/off> (off)
+    on: town shells in a combat session take their configured behaviour
+    from 06:00 to 17:59 (server time), social from 18:00 to 21:59 and sit
+    from 22:00 to 05:59. It is applied in the combat tick, so only to
+    town shells whose behaviour is combat or guard, while a player is near.
+
+population_engine_vending_enable: <on/off> (off, shipped on)
+    on: vendor shells open a real vending shop (5.3).
+
+---------------------------------------
+4. Data
+---------------------------------------
+
+Every file has a Header (Type, Version), a Body and imports
+db/import/<same file name>. The files are not split into pre-re/ and re/:
+item, job and skill names are checked against the databases the server
+loaded. The load order is names, chat, skill_db, gear_sets, engine, pvp,
+vendor_pop, spawn, vendors.
+
+4.1. Job databases
+
+population_gear_sets.yml, population_engine.yml, population_pvp.yml and
+population_vendor_pop.yml share the type POPULATION_ENGINE_DB (version 2):
+
+    population_gear_sets.yml  - Loaded first. Gear sets (and profiles) the
+                                other three files can use. Job entries are
+                                refused.
+    population_engine.yml     - Autosummon and @populate shells.
+    population_pvp.yml        - Arena shells and the arena job pool.
+    population_vendor_pop.yml - Vendor shells of the VendorPlacement pass.
+
+A spawn looks for the job in population_engine.yml, then population_pvp.yml,
+then population_vendor_pop.yml, and repeats this with the job's first class
+when the job has no entry (arena shells look in population_pvp.yml first).
+A shell without any entry gets built-in random equipment.
+
+Entries are processed in file order, so a gear set or profile must come
+before the entries that use it, or be in population_gear_sets.yml.
+
+    - GearSetName: <name>     Equipment slots and Arrow only.
+    - Profile: <name>         A template: every field below except the
+                              slots, Skills and Arrow, plus Jobs.
+    - Job: <job id>           One job, with any field below.
+    - ArenaJobPool: [ ... ]   Job IDs or job names for arenas (5.6).
+
+Equipment slots: Weapon, Shield, HeadTop, HeadMid, HeadBottom, Armor,
+Garment, Shoes, AccL, AccR (weapon, head_top, acc_l ... are accepted too).
+0 is an empty slot, an item ID or AegisName a fixed item, a list one random
+item per spawn. An item that does not exist or does not fit the slot
+(costume headgears and garments do) is dropped with a warning. Item IDs above
+65535 are not supported.
+
+Fields for profiles and job entries:
+
+Behavior          none, wander, combat (default), support, sit, social,
+                  vendor or guard (5.3).
+TownBehavior      Same values. Replaces Behavior for shells spawned from
+FieldBehavior     the Towns, Fields or Dungeons list of population_spawn.yml.
+DungeonBehavior   Arena shells use DungeonBehavior.
+Role              none (default), tank, support or attacker (5.4).
+Flags             List of mortal, immortal, attack_only (basic attacks
+                  only), skill_only (no basic attacks). Shells take no
+                  damage unless mortal is set.
+Str, Agi, Vit,    A number or [min, max], rolled per spawn, 1-999.
+Int, Dex, Luk     Default 90-109 each.
+BaseLevel         A number or [min, max]. Default 99.
+JobLevel          A number or [min, max]. Default 70.
+Hair, HairColor,  A number or [min, max], kept within the client.conf
+ClothesColor      limits. Default: the highest hair style and random
+                  colours.
+Sex               M or F. Jobs of one sex always use it; otherwise random.
+NameProfile       Profile of population_names.yml (4.5). Default "default".
+NamePrefix,       Text put before and after the generated name.
+NameSuffix
+ChatProfile       Profile of population_chat.yml (4.6). Default "default".
+VendorKey         Entry of population_vendors.yml (4.4).
+VendorMessage     Text shown above a vendor shell when it spawns; also the
+                  shop title when the vendor entry has no Title.
+GuardRange        Read but not used.
+Script            Script run once when the shell spawns, with the shell
+                  attached. Statements that start with setriding,
+                  setfalcon, setcart, setarrow, setbullet or setkunai only
+                  run then; all other statements (bonus ...) are kept as a
+                  permanent bonus script of the shell. A profile's Script
+                  comes before the job entry's own Script.
+
+Job entries only:
+
+Job               Job ID; it must exist in the job database.
+Profile           Profile to inherit; the entry's own fields override it.
+GearSet           Gear set to inherit; slot fields of the entry replace
+                  single slots.
+Arrow             false: the engine equips no ammunition (default true).
+                  The engine also equips none when the shell has a Script;
+                  use setarrow, setbullet or setkunai there.
+Skills            true (default): every skill of the job's tree at its
+                  highest level. false: only Basic Skill and First Aid. A
+                  list of { Skill: <name> or SkillId: <id>, Level: <n> }
+                  (Level default 10) grants these skills up to Level and is
+                  the rotation when population_skill_db.yml has no entry
+                  for the job (4.2).
+InitScript        Accepted instead of Script.
+
+A job entry with a VendorKey and neither Behavior nor TownBehavior gets
+TownBehavior: vendor.
+
+Profiles only:
+
+Jobs              Map of <job name>: <gear set name>, true (no gear set) or
+                  false (skipped). Creates one job entry per job that
+                  inherits the profile and the gear set (including its
+                  Arrow). Job names: Novice, Swordsman, Mage, Archer,
+                  Acolyte, Merchant, Thief, Knight, Priest, Wizard,
+                  Blacksmith, Hunter, Assassin, Crusader, Monk, Sage, Rogue,
+                  Alchemist, Bard, Dancer, SuperNovice, Gunslinger, Ninja,
+                  HighNovice, HighSwordsman, HighMage, HighArcher,
+                  HighAcolyte, HighMerchant, HighThief, LordKnight,
+                  HighPriest, HighWizard, Whitesmith, Sniper, AssassinCross,
+                  Paladin, Champion, Professor, Stalker, Creator, Clown,
+                  Gypsy, Taekwon, StarGladiator, StarGladiatorUnion,
+                  SoulLinker. Spaces are ignored ("Lord Knight").
+
+Example:
+
+	- GearSetName: my_bow
+	  Weapon: [ Bow, Composite_Bow ]
+	  Armor: Tights
+
+	- Profile: my_archers
+	  Jobs:
+	    Archer: my_bow
+	    Hunter: my_bow
+	  BaseLevel: [ 70, 99 ]
+	  Flags:
+	    - mortal
+	  TownBehavior: wander
+	  FieldBehavior: combat
+	  Script: |
+	    setarrow;
+	    bonus bDex,5;
+
+4.2. Skills (population_skill_db.yml)
+
+Type POPULATION_SKILL_DB, version 1. One entry per job; an entry with the
+same JobId replaces the earlier one.
+
+    - JobId: <job id>
+      Skills:
+        - SkillId: <skill name or ID>
+          Level: <level>             (default 1)
+          Rate: <0-10000>            (default 10000)
+          State: any | has_target | no_target, or 0-2
+          Target: current | self | ally, or 0-2
+          Condition: <name or tree>  (default always)
+          CondValue: <value>
+          AroundRange: <0-15>
+          AroundTarget: <true/false>
+          Cooldown: <milliseconds>
+
+A shell uses the entry of its job, else that of its first class. Such an
+entry replaces the Skills list of the job entry (4.1). Without either, the
+shell has no skill rotation.
+
+- Target current: offensive rotation. The shell must know the skill; the
+  level used is the lower of Level and the learned level.
+- Target ally: cast on an ally within the skill's range (another shell in
+  a combat session; in an arena also the real player of team 2) that does
+  not have the skill's status yet. The shell must know the skill. Only
+  the conditions always, ally_hp_below, ally_status and not_ally_status
+  find an ally.
+- Target self: self-buff upkeep, cast at Level even when the shell has not
+  learned the skill.
+- State no_target entries are not used. any and has_target behave alike.
+- The rotation goes round the list in file order. Rate is the chance (per
+  10000) that the entry is used when its turn comes; when the roll fails,
+  no skill is used in that pick. 0 disables the entry.
+- Cooldown: wait before the same skill can be used again.
+- AroundRange: offensive ground and trap skills are placed on a random
+  free cell within this many cells of the shell. AroundTarget: true only
+  makes the target's cell the fallback when no free cell is found.
+
+Conditions (CondValue is a number 0-255 unless stated):
+
+    always                  No condition.
+    hp_below, hp_above      Own HP% below / above CondValue.
+    sp_below, sp_above      Own SP% below / above CondValue.
+    enemy_hp_below,         Target HP% below / above CondValue.
+    enemy_hp_above
+    enemy_status,           Target has / has not the status CondValue
+    not_enemy_status        (SC_FREEZE, or freeze).
+    self_status,            Own status, as above.
+    not_self_status
+    ally_status,            An ally within 9 cells has / lacks the status.
+    not_ally_status
+    ally_hp_below           An ally within 9 cells is below CondValue HP%.
+    ally_count_nearby       At least CondValue allies within 9 cells.
+    distance_below,         Distance to the target at most / more than
+    distance_above          CondValue.
+    enemy_count_nearby      At least CondValue tracked monsters within the
+                            detection radius.
+    map_zone                Spawned from the town, field or dungeon list
+                            (CondValue town, field, dungeon or 1-3).
+    melee_attacked,         A tracked monster with an attack range below 4
+    range_attacked          / of 4 or more targets the shell.
+    self_targeted           Damaged within the last CondValue seconds
+                            (default 3), or targeted by a tracked monster
+                            within 8 seconds of the last damage.
+    self_being_cast_on      A unit is casting on the shell, or a ground
+                            skill within CondValue cells (default 3).
+    has_sphere              At least CondValue spirit spheres.
+    enemy_hidden            A tracked monster is hiding or cloaking.
+    enemy_casting,          The target is casting / casting a ground or
+    enemy_casting_ground    trap skill.
+    cell_has_skill_unit     A skill unit is on the shell's cell.
+    enemy_element           Target defence element (Neutral ... Undead or
+                            0-9).
+    enemy_race              Target race (Formless ... Dragon or 0-9).
+    enemy_is_boss           The target is an MVP.
+    after_skill             The shell's last cast was the skill CondValue.
+    damaged_gt              The last hit took more than CondValue% max HP.
+    skill_used              The skill CondValue hit the shell within the
+                            last 3 seconds.
+
+Condition may also be a list (all must hold) or a map whose keys are the
+gates AND, OR, NAND, NOR, XOR, NXOR, each with a list of children; several
+keys are combined with AND. A leaf is [not_]<target>_<rest>, target self,
+enemy, ally or master:
+
+    <rest> is a condition name above (taken without a CondValue, so with a
+    threshold of 0), hp_pct, sp_pct, hp, sp or distance with an optional
+    _<lt|le|gt|ge|eq><number> tail (default gt0), or a status name without
+    SC_ (self_hiding, not_enemy_safetywall). <enemy|ally>_count_nearby
+    needs a tail other than eq.
+
+A leaf that cannot be parsed is logged at start-up and is always false.
+
+	Condition:
+	  AND:
+	    - not_self_hiding
+	    - OR:
+	        - self_targeted
+	        - self_hp_pct_lt40
+
+4.3. Autosummon (population_spawn.yml)
+
+Type POPULATION_SPAWN_DB, version 1. Entries with the same Profile are
+merged.
+
+    - Profile: <name>          Profile of population_engine.yml (required).
+      Towns: [ <map>, ... ]
+      TownsPopulation: <n>     Shells for all Towns maps together.
+      TownsMaxPerMap: <n>      Cap per map, 0: none (default).
+      Fields, FieldsPopulation, FieldsMaxPerMap
+      Dungeons, DungeonsPopulation, DungeonsMaxPerMap
+
+Each list gets floor(population / maps) shells per map, the first
+(population % maps) maps one more, then the MaxPerMap cap. Each shell gets a
+random job among the job entries of population_engine.yml that inherit the
+profile. A population of 0 or no maps disables that list.
+
+4.4. Vending (population_vendors.yml, population_vendor_pop.yml)
+
+Type POPULATION_VENDORS_DB, version 1.
+
+    - VendorKey: <key>          Referenced by VendorKey (required).
+      Title: <text>             Shop title.
+      Type: static | dynamic    (default static)
+      MaxSlots: <1-12>          (default 12)
+      Stock:                    Static only:
+        - Item: <name or ID>
+          Amount: <n>           (default 1)
+          Price: <zeny>         (default 0: the item's buy price)
+      PriceMultiplier: <n>      Dynamic: price = sell price x n / 100
+                                (default 100).
+      SourceMaps: [ <map>, ... ]
+      SourceCategory: dungeon | field | both
+      RandomizePerShell: <true/false>   (default false)
+      ItemFlags:
+        AllowEquipment: <bool>  (default false)
+        AllowCards: <bool>      (default false)
+        AllowEtc: <bool>        (default true)
+        AllowUsable: <bool>     (default true)
+      MaxAmount: <n> or [ <min>, <max> ]   (default 30; at most 30000)
+      VendorPlacement:          One map, or a list of maps:
+        Map: <map>
+        MinSpacing: <cells>     (0: none)
+        MaxVendors: <n>         (0: see below)
+        Area: { X1: , Y1: , X2: , Y2: }
+
+A dynamic shop sells the drops of the monsters spawned on SourceMaps, or on
+the Dungeons and/or Fields maps of population_spawn.yml (SourceCategory), or
+on the shell's own map. Items are ranked by drop rate; RandomizePerShell
+shuffles the order of the source maps for every shell. Equipment is sold one
+at a time; other items in amounts rolled within MaxAmount.
+
+A vendor shell without a usable entry (no VendorKey, an unknown key, an
+empty static stock or a dynamic shop without drops) sells eleven built-in
+consumables (potions, wings, Anodyne, Aloevera, Concentration and Awakening
+Potion) at their buy price.
+
+VendorPlacement: when any entry has one, vendor shells only spawn on the
+listed maps, within Area and at least MinSpacing cells from other vendor
+shells, and a map takes at most MaxVendors of them. If two entries name the
+same map, the later one wins. Every 10 seconds the autosummon timer also
+fills each listed map up to MaxVendors (12 when 0) with jobs from
+population_vendor_pop.yml whose Behavior or one of whose category
+behaviours is vendor (population_engine.yml when that file has no entries).
+These shells use TownBehavior.
+
+4.5. Names (population_names.yml)
+
+Type POPULATION_NAMES_DB, version 1.
+
+    - GlobalLists:
+        Prefixes, SyllablesStart, SyllablesMid, SyllablesEnd, Adjectives,
+        Nouns: [ ... ]          Word lists for all profiles.
+        Blocklist: [ ... ]      Rejected substrings (case-insensitive),
+                                also applied to chat lines.
+    - Profile: <key>
+      Strategy: syllables | adjective_noun (adj_noun) | pick_one |
+                bot_index | prefix_number
+      MaxLen: <n>               (default 22)
+      MinLen: <n>               Read but not used.
+      SyllablesStart, SyllablesMid, SyllablesEnd, Adjectives, Nouns, Pool
+
+syllables joins one start, middle and end part; adjective_noun makes
+<Adjective>_<Noun>; pick_one takes a name from Pool; prefix_number appends a
+number to a random prefix; bot_index uses population_engine_name_bot_fallback.
+A profile's own lists are used before the global ones. Without a Strategy:
+syllables when any syllable list exists, else pick_one with a Pool, else
+adjective_noun with global adjectives and nouns, else bot_index. An unknown
+or empty NameProfile uses the profile "default".
+
+The name is cut to MaxLen, NamePrefix and NameSuffix are added, and the
+result is cut to 23 characters. A name that hits the Blocklist or is used by
+a character on the map-server (player or shell) is rolled again, up to 32
+times.
+
+4.6. Chat (population_chat.yml)
+
+Type POPULATION_CHAT_DB, version 1.
+
+    - ChatGlobal:
+        Categories:
+          <category>: [ "line", ... ]
+    - ChatProfile: <key>
+      Categories: [ <category>, ... ]
+
+ChatGlobal must come before the profiles that use its categories. A profile
+is the lines of its categories put together; a profile listed twice gets
+both sets. Lines may contain {name}, {map} and {job}. Ambient lines and
+replies that hit the name Blocklist are not said.
+
+The engine also reads these categories directly: vendor_call, shop, hunt,
+idle, pvp_taunt, pvp_kill (where $victim is the killed player's name) and
+party_invite_accept (5.5).
+
+---------------------------------------
+5. Behaviour
+---------------------------------------
+
+5.1. Shells
+
+- Account and character IDs are 95000000 + index (index 1-4999999); every
+  character in that account ID range is treated as a shell.
+- Group 0, at least 100000 zeny, no client connection.
+- Skills of shells have no weapon, ammunition, item or minimum HP
+  requirement (HP, SP and zeny costs, spirit spheres and states still
+  apply).
+- Hunter and Sniper shells carry 500 Booby Traps.
+- A ranged shell without Script and with Arrow: true gets 500 of the
+  lightest fitting ammunition without a level requirement. When it takes a
+  monster target it equips the arrow or bullet from its inventory that
+  suits the monster's element best.
+- Shells on the same map share a party ID that is not a real party, so
+  party skills work between them. They count as map users: with
+  dynamic_mobs, monsters spawn on maps that only shells occupy.
+
+5.2. Spawning
+
+Autosummon: the timer runs 100 ms after the databases are loaded, then
+every 10 seconds. Each run:
+1. Warps shells that left their spawn map back to their spawn cell.
+2. Writes the live shell count to `cp_population_stats` when it changed.
+3. Fills every population_spawn.yml list up to its quota (4.3), counting
+   the shells of the profile's jobs already on each map, within
+   population_engine_autosummon_batch_size and
+   population_engine_max_count.
+4. Runs the VendorPlacement pass (4.4).
+A shell is placed on a random walkable cell away from the map edge (a fifth
+of the map size, at most 50 cells).
+
+@populate <quantity> spawns shells of random jobs on one map (7.).
+population_arena_start spawns arena shells (5.6).
+
+5.3. Behaviours
+
+combat   Starts a combat session (5.4). When no player is near, it only
+         takes wander steps.
+guard    Like combat; with no target the shell walks back to its spawn
+         cell.
+wander,  No combat session; the shell only wanders and chats. Map chat
+social   replies to social and wander shells use the idle category.
+support,
+none
+sit      Sits at its spawn cell.
+vendor   Sits, shows VendorMessage and, with
+         population_engine_vending_enable, opens a shop: the shell gets
+         Vending level 10 and a cart, and the shop sells the stock of its
+         VendorKey (4.4). Players buy from it like from any shop.
+
+The wander timer moves every shell that has no target and can move, so
+sitting and vending shells stay in place.
+
+5.4. Combat AI
+
+Only shells in a combat session within AREA_SIZE + 4 cells of a real player
+run the AI, once per population_engine_shell_timer_ms. Outside arenas they
+fight monsters only: monsters they may attack, in line of sight and within
+AREA_SIZE, not hidden or cloaked, without special AI (player summons and
+similar), and not protected by ksprotection. A tick:
+
+1. A shell with Hiding or Cloaking among its self-buffs (4.2) uses it at
+   once when a cast is aimed at it. Hiding and Cloaking end 4 seconds
+   after the last hit when nothing is cast at the shell.
+2. Flee, boss avoidance and target switching (population_engine_ai).
+3. Role tank: with no target, takes a monster within 12 cells that attacks
+   another shell. Role support: with no target, walks to an ally within
+   12 cells below 50% HP and stays there.
+4. Self-buff upkeep, then ally-targeted skills (4.2).
+5. With a target in range: a skill of the rotation, or a basic attack
+   (population_engine_shell_basic_attack_chance, Flags: attack_only and
+   skill_only; Berserk allows basic attacks only). Shells that know Call
+   Spirits, Fury or Asura Strike follow a fixed spirit sphere sequence
+   before the rotation. Out of range: a long-range skill, else walk
+   towards the target.
+6. With no target: walk forward or roam (population_engine_shell_move_*)
+   until a monster is found.
+
+A target is dropped after 4 seconds without an attack, and skipped for
+500 ms after repeated failed skill uses on it. A shell in a combat session
+that is hit runs its self-buff upkeep and, with a target, one rotation pick
+at once, so conditions such as melee_attacked or self_targeted react
+without waiting for the next tick.
+
+5.5. Chat and parties
+
+Every population_engine_chat_tick_ms the chat timer lets shells say a
+random line as map chat ("Name : line"): vendor shells from vendor_call,
+arena shells from pvp_taunt, shells with a target from hunt, all others
+from their ChatProfile.
+
+A shell whispers back to a whisper, and answers in map chat when a player
+on its map says its name (population_engine_chat_reply_enable): from
+pvp_taunt in arenas, shop for vendors, hunt while hunting, idle for social
+and wander shells, otherwise the ChatProfile. A whisper that contains
+"party", "pt", "join" or "invite" instead makes the shell accept a pending
+party invitation from that player, or answer from party_invite_accept and
+accept the player's next invitation (shells in a combat session only).
+This also works with replies off.
+
+A shell that kills a real player says a pvp_kill line.
+
+All lines share the per-shell cooldown.
+
+5.6. Arena
+
+population_arena_start (6.) spawns 1-25 shells on a map with a team:
+
+- Team 1 shells attack the real players on the map.
+- Team 2 shells attack team 1 shells and treat the real players of the map
+  as allies (ally skills, no friendly fire).
+- battle_check_target applies these relations on that map before the
+  party, guild and PvP checks.
+
+Arena shells are always mortal and use their DungeonBehavior (combat or
+guard is needed to fight). The job pool is the ArenaJobPool of
+population_pvp.yml or, without one, every job in that file; when that is
+empty, the ArenaJobPool of population_engine.yml; otherwise a built-in mix.
+population_arena_stop removes them. The map's PvP flag is not checked or
+set; the Arena Manager NPC can set mf_pvp (.enable_pvp_flag).
+
+5.7. Death, persistence and cleanup
+
+- Shells without Flags: mortal take no damage.
+- A mortal shell that dies comes back after 5 seconds at its spawn cell
+  with full HP and SP and a cleared state; combat and guard shells restart
+  their combat session.
+- OnPCDieEvent and OnPCKillEvent do not run for shells.
+- Shells are never saved: no character, registry or achievement data
+  reaches the char-server.
+- Shells that were removed from their map by other code are freed by the
+  next combat or wander run. @populate stop and the map-server shutdown
+  free every shell.
+
+---------------------------------------
+6. Script commands
+---------------------------------------
+
+Documented in doc/script_commands.txt:
+
+    population_arena_start  Spawn arena shells (map, count, center, job,
+                            team).
+    population_arena_stop   Remove the arena shells of a map.
+    population_arena_jobs   Arena job pool as a comma separated string.
+    setarrow                Equip 500 arrows for the weapon in hand.
+    setbullet               Equip 500 bullets, shells or grenades.
+    setkunai                Equip 500 kunai.
+
+setarrow, setbullet and setkunai work for any character; in a job entry's
+Script they equip the shell's ammunition (4.1).
+
+---------------------------------------
+7. GM commands
+---------------------------------------
+
+Documented in doc/atcommands.txt:
+
+    @populate <quantity> [<map>]   Spawn shells on a map.
+    @populate stop | status | stats | timing | timingreset
+    @reloadpopenginedb             Reload all population databases (also
+                                   @reload popenginedb).
+
+---------------------------------------
+8. Notes
+---------------------------------------
+
+- The engine starts with the map-server. "@populate stop" cancels the
+  combat, wander, chat and autosummon timers, and only a restart creates
+  them again: shells spawned after a stop (@populate <quantity>, arena
+  shells) have no AI, do not wander or chat, and mortal ones do not come
+  back after dying, until the next restart.
+- @reloadpopenginedb does not change shells that already exist; their
+  equipment, stats and skill lists stay as they were spawned.
+- Real account IDs must stay below 95000000.
+- Combat-start failures are logged with a reject code ("population combat
+  replica did not start"); database problems are logged at start-up and on
+  reload. @populate stats and @populate timing show counters and timing.
+- Registered but unused battle settings (not in the conf file):
+  population_engine_combat_budget_per_tick,
+  population_engine_combat_max_budget, population_engine_arena_custom_pool.
+
+
+UPDATE: 2026-10-18
+==================
+Based on rAthena d4b8e7b8f16061cc2496d377ac8f777ce72a4f39 (2026-10-06)
+and the Population Engine from BanquetOfHeroes 7284238df5a49f2a045af583a074a15f2e2cf8f3.
+Only the Population subsystem and its integration are ported. Banquet's server
+credentials, client security, AutoCombat, AutoSupport and other custom systems
+are not dependencies of this repository.
+
+VENDORS
+-------
+Use a different Profile name for each shop identity in population_vendor_pop.yml.
+Profiles may share Merchant, Blacksmith, or any other valid job. Every profile/job
+pair is retained, rather than allowing the last profile to replace other shops
+with the same job. Mortal vendor shells reopen their selected shop after respawn.
+Each shell keeps its selected configuration throughout its
+lifetime, including chat and respawn.
+
+VendorPlacement belongs to its VendorKey. MaxVendors is now a limit PER VENDOR
+KEY on each of that key's maps. Area and MinSpacing are also enforced for that
+key. Spacing is checked against all existing shops; crowded placements retry on
+a later tick. There is no fallback which ignores spacing or the placement area.
+Use population_engine_max_count to cap the population across the whole server.
+The placement pass gives each eligible profile one shell before adding duplicates.
+
+Example (add rows to the Body of the respective files):
+
+population_vendor_pop.yml:
+  - Profile: crafting_materials
+    Jobs:
+      Merchant: para_merchant
+    NamePrefix: Craft
+    Flags: [mortal]
+    TownBehavior: vendor
+    VendorKey: crafting_materials
+    Script: |
+      setcart;
+
+population_vendors.yml:
+  - VendorKey: crafting_materials
+    Title: Crafting Materials
+    Type: static
+    Stock:
+      - { Item: Jellopy, Amount: 100, Price: 10 }
+    VendorPlacement:
+      Map: prt_in
+      MaxVendors: 1
+      MinSpacing: 2
+
+To make 100 different Prontera shops, define 100 uniquely named profiles and
+vendor keys, each with its own stock and Prontera placement. Set MaxVendors: 1
+per key and leave enough walkable space and global population capacity. Adding
+more keys does not require inventing new job IDs.
+
+COMPANIONS
+----------
+Companion Recruiter: prontera 158,183. The NPC can create a real party for a solo
+player, then lets its leader recruit up to four selected jobs or dismiss them.
+The party must have enough free slots. Companions use the normal party display,
+heals/buffs and EXP rules, but their fake characters are never persisted to SQL.
+They follow, catch up by teleport, and follow map changes within this map-server
+process. Logout, party departure, dismissal and engine stop remove them.
+They are unavailable in PvP, battleground and guild-war maps; entering one
+removes the player's companions. A cross-map-server transfer also removes them.
+The engine must be running and the job must be configured in population_engine.yml or population_pvp.yml.
+
+Script commands:
+  population_companion_recruit(job_id) -> 1 on success, 0 on failure
+  population_companion_dismiss() -> number dismissed
+
+THIRD JOBS
+----------
+Renewal configurations include the thirteen third-job branches and their
+transcendent forms, with levels 100-120, existing starter gear, and boss-avoidance.
+The normal job skill tree is granted; the generic skill selector can use third
+job skills. Class-specific advanced resource rotations still need live balance
+checks. Pre-renewal skips these entries. Fourth jobs are excluded from random
+population selection and are not included in the shipped profiles.
+
+HANGOUTS
+--------
+Behavior: hangout (alias: chill) sits at a permanent post and ignores the daily
+cycle. It retaliates against the monster that attacks it within eight cells,
+then walks back and sits. It does not acquire other monsters proactively.
+Use Flags: [mortal] if the actor should take damage and trigger retaliation.
+A level-99 administrator can place a temporary hangout via the Recruiter NPC.
+Permanent configured Posts in population_spawn.yml survive server restarts:
+
+  - Profile: pve_archer
+    Posts:
+      - { Map: prontera, X: 151, Y: 29 }
+      - { Map: prontera, X: 159, Y: 29 }
+
+Each post creates one hangout using that profile's appearance, stats and gear.
+Coordinates must be walkable. Normal Towns/Fields/Dungeons populations for the
+same profile continue to work separately.
+
+ARENAS
+------
+Arena Manager is available in 42 town locations. Each match selects one of five
+PvP maps, then 1v1, 3v3, or 5v5 and the jobs of all opponents and allies. Rooms
+are reserved per player, preventing another player from stopping a running match.
+Canceling job selection creates no shells. Stop or logout cleans up the match;
+any PvP flag added by the manager is restored. Existing PvP flags are preserved.
+
+WoE/guild war simulation is deferred. This update does not add siege objectives,
+emperium targeting, guild ownership, or class-specific siege tactics.
+
+VALIDATION
+----------
+Run: python tools/integration/test_population_spawn.py -v
+     python tools/integration/test_population_config.py -v (requires PyYAML)
+The regression harness compiles functions extracted from production source. It
+covers stats, placement, skills, equipment, scripts, behavior, vendor stock,
+spawn cleanup and a 120-profile vendor catalog with per-key map constraints.
+Clean Windows Release solution rebuild succeeded with Visual Studio 18.
+Eleven production-function suites and four configuration/map-cache suites passed locally.
+Full server builds and live in-game acceptance are separate checks. In particular,
+party packets, map transitions, shop purchasing and class balance need game-client
+validation before deployment to an established server.

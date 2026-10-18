@@ -11,10 +11,8 @@ if( BUILD_SERVERS )
 message( STATUS "Creating target map-server" )
 file(GLOB_RECURSE MAP_HEADERS ${MAP_SOURCE_DIR}/*.hpp)
 list(FILTER MAP_HEADERS EXCLUDE REGEX ".*/skills/.*")
-list(FILTER MAP_HEADERS EXCLUDE REGEX ".*/population_engine/.*")
 file(GLOB_RECURSE MAP_SOURCES ${MAP_SOURCE_DIR}/*.cpp)
 list(FILTER MAP_SOURCES EXCLUDE REGEX ".*/skills/.*")
-list(FILTER MAP_SOURCES EXCLUDE REGEX ".*/population_engine/.*")
 # Add skill factory/impl files as separate translation units per job category
 # Individual skill files are NOT compiled directly - they are #included by their job factory TUs
 file(GLOB SKILL_FACTORY_SOURCES ${MAP_SOURCE_DIR}/skills/skill_factory.cpp ${MAP_SOURCE_DIR}/skills/skill_impl.cpp)

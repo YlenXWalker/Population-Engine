@@ -108,3 +108,7 @@ Body:
       - "Jara"
       - "Beni"
       - "Kira"
+
+Footer:
+  Imports:
+  - Path: db/import/population_names.yml

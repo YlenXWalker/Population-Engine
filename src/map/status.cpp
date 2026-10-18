@@ -33,7 +33,7 @@
 #include "path.hpp"
 #include "pc.hpp"
 #include "population_engine.hpp"
-#include "population_engine/runtime/population_engine_combat.hpp"
+#include "population_engine/population_combat.hpp"
 #include "pc_groups.hpp"
 #include "pet.hpp"
 #include "script.hpp"

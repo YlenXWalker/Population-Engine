@@ -63,6 +63,7 @@ int32 party_getmemberid(const party_data* p, const map_session_data* sd);
 map_session_data* party_getavailablesd(const party_data *p);
 
 int32 party_create( map_session_data& sd, char *name, int32 item, int32 item2 );
+bool party_add_population_member(map_session_data& owner, map_session_data& bot);
 void party_created(uint32 account_id,uint32 char_id,int32 fail,int32 party_id,char *name);
 int32 party_request_info(int32 party_id, uint32 char_id);
 bool party_invite( map_session_data& sd, map_session_data* tsd );

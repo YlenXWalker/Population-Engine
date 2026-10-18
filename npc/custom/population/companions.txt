@@ -1,0 +1,37 @@
+// Population companions are transient map-server party members (maximum four).
+prontera,158,183,4	script	Companion Recruiter	4_M_GUNSLINGER,{
+	mes "[Companion Recruiter]";
+	mes "Choose companions to follow you and fight monsters. You must lead the party.";
+	next;
+	.@menu$ = "Recruit:Dismiss my companions:Cancel";
+	if (getgmlevel() >= 99) .@menu$ += ":Place a permanent hangout here";
+	.@action = select(.@menu$);
+	if (.@action == 3) close;
+	if (.@action == 2) {
+		mes "Dismissed " + population_companion_dismiss() + " companion(s).";
+		close;
+	}
+	if (.@action == 1 && !getcharid(1)) {
+		party_create "Companions " + getcharid(0);
+		for (.@wait = 0; .@wait < 30 && !getcharid(1); ++.@wait) sleep2 100;
+		if (!getcharid(1)) { mes "Party creation failed. Create a party and try again."; close; }
+	}
+	if (.@action == 1 && getpartyleader(getcharid(1), 2) != getcharid(0)) {
+		mes "Ask your party leader to recruit companions.";
+		close;
+	}
+	explode(.@ids$, population_arena_jobs(), ",");
+	.@menu$ = "";
+	for (.@i = 0; .@i < getarraysize(.@ids$); ++.@i)
+		.@menu$ += jobname(atoi(.@ids$[.@i])) + ":";
+	.@pick = select(.@menu$ + "Cancel") - 1;
+	if (.@pick >= getarraysize(.@ids$)) close;
+	if (.@action == 4) {
+		.@ok = population_hangout_spawn(atoi(.@ids$[.@pick]));
+		mes .@ok ? "Hangout placed. It remains until the engine stops or the server restarts." : "Placement failed.";
+	} else {
+		.@ok = population_companion_recruit(atoi(.@ids$[.@pick]));
+		mes .@ok ? "Your companion has joined." : "Recruitment failed. Check the four-companion limit, party capacity, job configuration, and population limit.";
+	}
+	close;
+}
