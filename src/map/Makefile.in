@@ -3,7 +3,7 @@ COMMON_H = $(shell ls ../common/*.hpp)
 COMMON_AR = ../common/obj/common.a
 COMMON_INCLUDE = -I../common/
 
-RA_INCLUDE = -I../
+RA_INCLUDE = -I. -I../
 
 LIBCONFIG_H = $(shell ls ../../3rdparty/libconfig/*.h)
 LIBCONFIG_AR = ../../3rdparty/libconfig/obj/libconfig.a
@@ -27,7 +27,6 @@ MAP_H = $(shell find ../ -type f -name "*.hpp") \
 
 MAP_OBJ = $(shell find . -type f -name "*.cpp" \
 			-not -path "./skills/*" \
-			-not -path "./population_engine/*" \
 			| sed -e "s/\.cpp/\.o/g" -e "s/^\.\///")
 # Add skill factory/impl files as separate translation units per job category
 # Individual skill files are NOT compiled directly - they are #included by their job factory TUs

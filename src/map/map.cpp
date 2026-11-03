@@ -50,7 +50,7 @@
 #include "pc.hpp"
 #include "pet.hpp"
 #include "population_engine.hpp"
-#include "population_engine/runtime/population_engine_combat.hpp"
+#include "population_engine/population_combat.hpp"
 #include "quest.hpp"
 #include "storage.hpp"
 #include "trade.hpp"

@@ -56,7 +56,7 @@
 #include "pc_groups.hpp"
 #include "pet.hpp" // pet_unlocktarget()
 #include "population_engine.hpp"
-#include "population_engine/runtime/population_engine_combat.hpp"
+#include "population_engine/population_combat.hpp"
 #include "quest.hpp"
 #include "skill.hpp" // skill_isCopyable()
 #include "script.hpp" // struct script_reg, struct script_regstr
@@ -11073,7 +11073,7 @@ bool pc_jobchange(map_session_data *sd,int32 job, char upper)
 	if( i&OPTION_CART && !pc_checkskill(sd, MC_PUSHCART) )
 		i&=~OPTION_CART;
 #else
-	if( sd->sc.getSCE(SC_PUSH_CART) && !pc_checkskill(sd, MC_PUSHCART) )
+	if( sd->sc.getSCE(SC_PUSH_CART) && !pc_checkskill(sd, MC_PUSHCART) && !population_engine_is_population_pc(sd->id) )
 		pc_setcart(sd, 0);
 #endif
 	if(i != sd->sc.option)

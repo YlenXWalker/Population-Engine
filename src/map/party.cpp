@@ -26,6 +26,7 @@
 #include "mapreg.hpp"
 #include "mob.hpp"
 #include "pc.hpp"
+#include "population_engine.hpp"
 #include "pc_groups.hpp"
 #include "trade.hpp"
 
@@ -49,6 +50,25 @@ static void party_fill_member( struct party_member& member, map_session_data& sd
 	member.lv = sd.status.base_level;
 	member.online = 1;
 	member.leader = leader;
+}
+
+// Population members live only in this map server. Never create fake char rows.
+bool party_add_population_member(map_session_data& owner, map_session_data& bot) {
+	auto* p = party_search(owner.status.party_id);
+	if (!p) return false;
+	int leader = party_getmemberid(p, &owner);
+	if (leader < 0 || !p->party.member[leader].leader) return false;
+	for (int i = 0; i < MAX_PARTY; ++i) {
+		if (p->party.member[i].account_id) continue;
+		party_fill_member(p->party.member[i], bot, 0);
+		p->data[i].sd = &bot;
+		++p->party.count;
+		bot.status.party_id = owner.status.party_id;
+		clif_party_info(*p);
+		clif_name_area(&bot);
+		return true;
+	}
+	return false;
 }
 
 /// Get the member_id of a party member.
@@ -278,6 +298,7 @@ int32 party_recv_info(struct party* sp, uint32 char_id)
 	bool rename = false;
 
 	nullpo_ret(sp);
+	population_engine_restore_party(sp);
 
 	p = (struct party_data*)idb_get(party_db, sp->party_id);
 
@@ -725,6 +746,12 @@ bool party_removemember( map_session_data& sd, uint32 account_id, const char* na
 	if( i == MAX_PARTY )
 		return false; // no such char in party
 
+	if (IS_POPULATION_ENGINE_ACCOUNT_ID(account_id)) {
+		if (auto* bot = map_id2sd(account_id)) bot->pop.companion_owner = 0;
+		party_member_withdraw(p->party.party_id, account_id, p->party.member[i].char_id,
+			p->party.member[i].name, PARTY_MEMBER_WITHDRAW_EXPEL);
+		return true;
+	}
 	party_trade_bound_cancel(sd);
 	intif_party_leave(p->party.party_id,account_id,p->party.member[i].char_id,p->party.member[i].name,PARTY_MEMBER_WITHDRAW_EXPEL);
 
@@ -991,6 +1018,8 @@ int32 party_changeleader(map_session_data *sd, map_session_data *tsd, struct par
 			return 0; // Shouldn't happen
 	}
 
+	if (IS_POPULATION_ENGINE_ACCOUNT_ID(p->party.member[tmi].account_id)) return 0;
+
 	// Change leadership.
 	p->party.member[mi].leader = 0;
 
@@ -1045,10 +1074,18 @@ void party_send_movemap(map_session_data *sd)
 	if( !sd->status.party_id )
 		return;
 
-	intif_party_changemap(sd,1);
+	if (!IS_POPULATION_ENGINE_ACCOUNT_ID(sd->status.account_id))
+		intif_party_changemap(sd,1);
 
 	p=party_search(sd->status.party_id);
 	if (!p) return;
+	if (IS_POPULATION_ENGINE_ACCOUNT_ID(sd->status.account_id)) {
+		const int32 member_id = party_getmemberid(p, sd);
+		if (member_id >= 0) {
+			party_fill_member(p->party.member[member_id], *sd, 0);
+			clif_party_member_info(*p, *sd);
+		}
+	}
 
 	if(sd->state.connect_new) {
 		//Note that this works because this function is invoked before connect_new is cleared.
@@ -1074,7 +1111,8 @@ void party_send_movemap(map_session_data *sd)
 
 void party_send_levelup(map_session_data *sd)
 {
-	intif_party_changemap(sd,1);
+	if (!IS_POPULATION_ENGINE_ACCOUNT_ID(sd->status.account_id))
+		intif_party_changemap(sd,1);
 }
 
 int32 party_send_logout(map_session_data *sd)
@@ -1085,7 +1123,8 @@ int32 party_send_logout(map_session_data *sd)
 	if(!sd->status.party_id)
 		return 0;
 
-	intif_party_changemap(sd,0);
+	if (!IS_POPULATION_ENGINE_ACCOUNT_ID(sd->status.account_id))
+		intif_party_changemap(sd,0);
 	p=party_search(sd->status.party_id);
 	if(!p) return 0;
 

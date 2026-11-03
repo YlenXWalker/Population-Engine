@@ -67,3 +67,7 @@ Body:
     VendorKey: "dungeon_drops"
     Script: |
       setcart;
+
+Footer:
+  Imports:
+  - Path: db/import/population_vendor_pop.yml

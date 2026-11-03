@@ -698,3 +698,20 @@ Body:
       - in_sphinx4
       - in_sphinx5
     DungeonsPopulation: 40
+  - Profile: third_jobs
+    Fields: [gef_fild14, gef_fild10]
+    FieldsPopulation: 6
+    FieldsMaxPerMap: 3
+    Dungeons: [gl_prison, gl_prison1]
+    DungeonsPopulation: 4
+    DungeonsMaxPerMap: 2
+
+# Permanent posts use an existing profile for appearance, gear, and stats.
+# Add these to any profile above (or its db/import override):
+#    Posts:
+#      - { Map: prontera, X: 151, Y: 29 }
+#      - { Map: prontera, X: 159, Y: 29 }
+
+Footer:
+  Imports:
+  - Path: db/import/population_spawn.yml

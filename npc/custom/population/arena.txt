@@ -1,131 +1,112 @@
-//===== Banquet of Heroes Script =====================================
-//= Population Arena Manager
-//===== Description ==================================================
-//= NPC that lets a player (or GM) enter a PvP map and fight against
-//= population engine shells to observe and study AI behaviour.
-//= population_arena_start / population_arena_stop script commands
-//= are used to spawn and remove the shells.
-//===== Configuration ================================================
-//= Edit .arena_map$, .sx/.sy (shell spawn center), and .return_map$
-//= plus .return_x/.return_y in the OnInit block below.
-//= The arena map must already have PvP mode enabled in map_flag
-//= configuration, OR set .enable_pvp_flag 1 to toggle it dynamically.
-//====================================================================
-
-// ── Arena Manager NPC ─────────────────────────────────────────────
-morocc,144,101,4	script	Arena Manager	4_M_GUNSLINGER,{
-
-	// ── Main menu: opponent count ──────────────────────────────────
-	mes "^336699[Arena Manager]^000000";
-	mes "Enter ^FF6600" + .arena_map$ + "^000000 and fight population shells.";
-	next;
-
-	switch(select(
-		"1v1 - 1 opponent (solo)",
-		"3v3 - 3 opponents + 2 allies",
-		"5v5 - 5 opponents + 4 allies",
-		"Stop arena",
-		"Cancel"
-	)) {
-	case 1: @shell_count = 1; break;
-	case 2: @shell_count = 3; break;
-	case 3: @shell_count = 5; break;
-	case 4: callsub S_Stop; end;
-	case 5: close;
-	}
-
-	// ── Build job menu once ────────────────────────────────────────
-	.@csv$ = population_arena_jobs();
-	explode(.@ids$, .@csv$, ",");
-	.@nj = getarraysize(.@ids$);
-	if (.@nj == 1 && .@ids$[0] == "") .@nj = 0;
-
-	.@menu$ = "Random Mix";
-	for (.@i = 0; .@i < .@nj; ++.@i)
-		.@menu$ = .@menu$ + ":" + jobname(atoi(.@ids$[.@i]));
-	.@menu$ = .@menu$ + ":Cancel";
-
-	// ── Stop previous arena, enable PvP flag ──────────────────────
-	population_arena_stop(.arena_map$);
-	if (.enable_pvp_flag) setmapflag .arena_map$, mf_pvp;
-	.@total_spawned = 0;
-
-	// ── Spawn enemies (1 per slot, each with its own job choice) ───
-	for (.@slot = 1; .@slot <= @shell_count; ++.@slot) {
-		mes "^336699[Arena Manager]^000000";
-		mes "Choose job for ^FF6600opponent " + .@slot + " of " + @shell_count + "^000000:";
-		next;
-		.@pick = select(.@menu$);
-		if (.@pick == .@nj + 2) {
-			if (.@total_spawned > 0) population_arena_stop(.arena_map$);
-			close;
-		}
-		.@job_id = 0;
-		if (.@pick > 1) .@job_id = atoi(.@ids$[.@pick - 2]);
-		// Spread spawn X by 5 cells per slot so shells don't stack on the same tile.
-		.@spawned = population_arena_start(.arena_map$, 1, .sx + (.@slot - 1) * 5, .sy, .@job_id, 1);
-		.@total_spawned += .@spawned;
-	}
-
-	// ── Spawn allies: (shell_count - 1) to make it even-sided ─────
-	// 1v1 = 0 allies; 3v3 = 2 allies; 5v5 = 4 allies (player counts as 1).
-	.@ally_count = @shell_count - 1;
-	for (.@slot = 1; .@slot <= .@ally_count; ++.@slot) {
-		mes "^336699[Arena Manager]^000000";
-		mes "Choose job for ^22AA22ally " + .@slot + " of " + .@ally_count + "^000000:";
-		next;
-		.@pick = select(.@menu$);
-		if (.@pick == .@nj + 2) break;  // Cancel ally selection, keep enemies
-		.@job_id = 0;
-		if (.@pick > 1) .@job_id = atoi(.@ids$[.@pick - 2]);
-		// Spawn allied shell near player start point, spread by 5 cells.
-		.@spawned = population_arena_start(.arena_map$, 1, .ax + (.@slot - 1) * 5, .ay, .@job_id, 2);
-		.@total_spawned += .@spawned;
-	}
-
-	mes "^336699[Arena Manager]^000000";
-	if (.@total_spawned <= 0) {
-		mes "^FF0000Failed to spawn any shells^000000. Check the server log.";
+// Shared arena manager. Each player reserves one room and chooses every job.
+-	script	Population Arena	-1,{
+	mes "[Population Arena]";
+	.@action = select("Start a match:Stop my match:Cancel");
+	if (.@action == 3) close;
+	if (.@action == 2) {
+		callsub S_Stop;
+		mes "Your match has ended.";
 		close;
 	}
-	mes "^22AA22" + .@total_spawned + " shell(s) spawned^000000 on ^FF6600" + .arena_map$ + "^000000.";
-	mes "You will be warped there now.";
+	if (@pop_arena_map$ != "") { mes "Stop your current match first."; close; }
+	.@choice = select("Arena 1:Arena 2:Arena 3:Arena 4:Arena 5:Cancel");
+	if (.@choice == 6) close;
+	.@map$ = "pvp_y_1-" + .@choice;
+	.@room = mapname2id(.@map$);
+	if (.@room <= 0) { mes "This arena is unavailable."; close; }
+	if ($@pop_arena_owner[.@room]) { mes "This arena is occupied. Choose another room."; close; }
+	.@size = select("1v1:3v3:5v5:Cancel");
+	if (.@size == 4) close;
+	.@enemies = .@size * 2 - 1;
+	explode(.@ids$, population_arena_jobs(), ",");
+	.@nj = getarraysize(.@ids$);
+	if (.@nj == 1 && .@ids$[0] == "") .@nj = 0;
+	.@menu$ = "Random Mix";
+	for (.@i = 0; .@i < .@nj; ++.@i) .@menu$ += ":" + jobname(atoi(.@ids$[.@i]));
+	.@menu$ += ":Cancel";
+	// Collect choices before reserving the room or creating any shells.
+	for (.@i = 0; .@i < 2 * .@enemies - 1; ++.@i) {
+		mes .@i < .@enemies ? "Choose opponent " + (.@i + 1) + "." : "Choose ally " + (.@i - .@enemies + 1) + ".";
+		next;
+		.@pick = select(.@menu$);
+		if (.@pick == .@nj + 2) close;
+		.@jobs[.@i] = .@pick == 1 ? 0 : atoi(.@ids$[.@pick - 2]);
+	}
+	if ($@pop_arena_owner[.@room]) { mes "Another player reserved this room."; close; }
+	$@pop_arena_owner[.@room] = getcharid(0);
+	@pop_arena_map$ = .@map$;
+	@pop_arena_had_pvp = getmapflag(.@map$, mf_pvp);
+	getmapxy @pop_arena_return$, @pop_arena_x, @pop_arena_y, BL_PC;
+	setmapflag .@map$, mf_pvp;
+	.@spawned = 0;
+	for (.@i = 0; .@i < 2 * .@enemies - 1; ++.@i)
+		.@spawned += population_arena_start(.@map$, 1, 0, 0, .@jobs[.@i], .@i < .@enemies ? 1 : 2);
+	if (.@spawned < 2 * .@enemies - 1) {
+		callsub S_Stop;
+		mes "The match could not be created. Check population capacity and job profiles.";
+		close;
+	}
 	close2;
-	warp .arena_map$, .px, .py;
+	warp .@map$, 0, 0;
 	end;
 
-// ── Stop: remove shells, remove PvP flag, warp player back ─────────
 S_Stop:
-	population_arena_stop(.arena_map$);
-	if (.enable_pvp_flag) removemapflag .arena_map$, mf_pvp;
-	mes "^336699[Arena Manager]^000000";
-	mes "Arena stopped. Warping back to ^FF6600" + .return_map$ + "^000000.";
-	close2;
-	warp .return_map$, .return_x, .return_y;
-	end;
+	if (@pop_arena_map$ == "") return;
+	.@room = mapname2id(@pop_arena_map$);
+	if ($@pop_arena_owner[.@room] == getcharid(0)) {
+		population_arena_stop(@pop_arena_map$);
+		if (!@pop_arena_had_pvp) removemapflag @pop_arena_map$, mf_pvp;
+		$@pop_arena_owner[.@room] = 0;
+	}
+	@pop_arena_map$ = "";
+	if (!@pop_arena_logging_out && @pop_arena_return$ != "") warp @pop_arena_return$, @pop_arena_x, @pop_arena_y;
+	return;
 
-OnInit:
-	// ── Configuration ────────────────────────────────────────────
-	.arena_map$ = "pvp_y_1-2";
-
-	// Enemy spawn center.
-	.sx = 86;
-	.sy = 161;
-
-	// Allied shell spawn center (player's side).
-	.ax = 169;
-	.ay = 161;
-
-	// Player warp-in point.
-	.px = 169;
-	.py = 161;
-
-	.return_map$ = "morocc";
-	.return_x    = 156;
-	.return_y    = 93;
-
-	// Set 1 to toggle PvP mapflag automatically.
-	.enable_pvp_flag = 0;
-	// ─────────────────────────────────────────────────────────────
+OnPCLogoutEvent:
+	@pop_arena_logging_out = 1;
+	callsub S_Stop;
 	end;
 }
+
+alberta,30,234,4	duplicate(Population Arena)	Arena Manager#alberta	4_M_GUNSLINGER
+aldebaran,142,131,4	duplicate(Population Arena)	Arena Manager#aldebaran	4_M_GUNSLINGER
+amatsu,200,84,4	duplicate(Population Arena)	Arena Manager#amatsu	4_M_GUNSLINGER
+ayothaya,210,166,4	duplicate(Population Arena)	Arena Manager#ayothaya	4_M_GUNSLINGER
+ba_maison,74,146,4	duplicate(Population Arena)	Arena Manager#ba_maison	4_M_GUNSLINGER
+brasilis,198,217,4	duplicate(Population Arena)	Arena Manager#brasilis	4_M_GUNSLINGER
+comodo,211,143,4	duplicate(Population Arena)	Arena Manager#comodo	4_M_GUNSLINGER
+dewata,202,180,4	duplicate(Population Arena)	Arena Manager#dewata	4_M_GUNSLINGER
+dicastes01,200,187,4	duplicate(Population Arena)	Arena Manager#dicastes01	4_M_GUNSLINGER
+ecl_in01,50,53,4	duplicate(Population Arena)	Arena Manager#ecl_in01	4_M_GUNSLINGER
+einbech,65,35,4	duplicate(Population Arena)	Arena Manager#einbech	4_M_GUNSLINGER
+einbroch,66,200,4	duplicate(Population Arena)	Arena Manager#einbroch	4_M_GUNSLINGER
+geffen,121,59,4	duplicate(Population Arena)	Arena Manager#geffen	4_M_GUNSLINGER
+gonryun,162,120,4	duplicate(Population Arena)	Arena Manager#gonryun	4_M_GUNSLINGER
+harboro1,300,206,4	duplicate(Population Arena)	Arena Manager#harboro1	4_M_GUNSLINGER
+hugel,98,145,4	duplicate(Population Arena)	Arena Manager#hugel	4_M_GUNSLINGER
+icecastle,187,212,4	duplicate(Population Arena)	Arena Manager#icecastle	4_M_GUNSLINGER
+izlude,130,146,4	duplicate(Population Arena)	Arena Manager#izlude	4_M_GUNSLINGER
+jawaii,253,132,4	duplicate(Population Arena)	Arena Manager#jawaii	4_M_GUNSLINGER
+lasagna,195,182,4	duplicate(Population Arena)	Arena Manager#lasagna	4_M_GUNSLINGER
+lighthalzen,160,92,4	duplicate(Population Arena)	Arena Manager#lighthalzen	4_M_GUNSLINGER
+louyang,219,100,4	duplicate(Population Arena)	Arena Manager#louyang	4_M_GUNSLINGER
+malangdo,142,114,4	duplicate(Population Arena)	Arena Manager#malangdo	4_M_GUNSLINGER
+malaya,233,200,4	duplicate(Population Arena)	Arena Manager#malaya	4_M_GUNSLINGER
+manuk,284,138,4	duplicate(Population Arena)	Arena Manager#manuk	4_M_GUNSLINGER
+mid_camp,212,288,4	duplicate(Population Arena)	Arena Manager#mid_camp	4_M_GUNSLINGER
+mora,57,146,4	duplicate(Population Arena)	Arena Manager#mora	4_M_GUNSLINGER
+morocc,158,93,4	duplicate(Population Arena)	Arena Manager#morocc	4_M_GUNSLINGER
+moscovia,225,184,4	duplicate(Population Arena)	Arena Manager#moscovia	4_M_GUNSLINGER
+niflheim,204,174,4	duplicate(Population Arena)	Arena Manager#niflheim	4_M_GUNSLINGER
+payon,181,100,4	duplicate(Population Arena)	Arena Manager#payon	4_M_GUNSLINGER
+prontera,157,183,4	duplicate(Population Arena)	Arena Manager#prontera	4_M_GUNSLINGER
+rachel,132,110,4	duplicate(Population Arena)	Arena Manager#rachel	4_M_GUNSLINGER
+sp_cor,162,166,4	duplicate(Population Arena)	Arena Manager#sp_cor	4_M_GUNSLINGER
+splendide,203,147,4	duplicate(Population Arena)	Arena Manager#splendide	4_M_GUNSLINGER
+thor_camp,248,68,4	duplicate(Population Arena)	Arena Manager#thor_camp	4_M_GUNSLINGER
+umbala,99,153,4	duplicate(Population Arena)	Arena Manager#umbala	4_M_GUNSLINGER
+veins,218,123,4	duplicate(Population Arena)	Arena Manager#veins	4_M_GUNSLINGER
+verus04,125,250,4	duplicate(Population Arena)	Arena Manager#verus04	4_M_GUNSLINGER
+wolfvill,146,144,4	duplicate(Population Arena)	Arena Manager#wolfvill	4_M_GUNSLINGER
+xmas,149,134,4	duplicate(Population Arena)	Arena Manager#xmas	4_M_GUNSLINGER
+yuno,159,51,4	duplicate(Population Arena)	Arena Manager#yuno	4_M_GUNSLINGER

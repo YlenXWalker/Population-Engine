@@ -1,0 +1,21 @@
+name: Population Engine regressions
+on:
+  pull_request:
+    paths:
+      - 'src/map/population_engine*'
+      - 'src/map/population_engine/**'
+      - 'tools/integration/population_spawn/**'
+      - 'tools/integration/test_population_spawn.py'
+      - 'tools/integration/test_population_config.py'
+      - 'db/population*.yml'
+      - 'npc/custom/population/**'
+      - '.github/workflows/test_population_engine.yml'
+  workflow_dispatch:
+jobs:
+  regressions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/integration/test_population_spawn.py -v
+      - run: python3 -m pip install pyyaml
+      - run: python3 tools/integration/test_population_config.py -v

@@ -1,0 +1,203 @@
+# This file is a part of rAthena.
+#   Copyright(C) 2021 rAthena Development Team
+#   https://rathena.org - https://github.com/rathena
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+###########################################################################
+# Population Engine Skill Database
+###########################################################################
+#
+# Per-job skill overrides for population shells.
+# Loaded at map-server startup and with @reloadpopengine.
+# Priority: this file > population_engine.yml Skills: > compiled job defaults > skill tree scan.
+#
+###########################################################################
+# - JobId:           Job class numeric ID (required).
+#   Skills:          Sequence of skill entries (required).
+#     SkillId:       Skill name (e.g. SM_BASH) or numeric ID (required).
+#     Level:         Skill level to cast. (Default: 1)
+#     Rate:          1–10000 per-10000 chance; 0 disables entry. (Default: 10000)
+#     State:         When to allow this skill entry.
+#                    any        (0) — always eligible (default).
+#                    has_target (1) — only while shell has an active combat target.
+#                    no_target  (2) — only while idle/roaming (no current target).
+#     Target:        Who the skill is cast on.
+#                    current (0) — shell's active combat target (default).
+#                    self    (1) — the shell itself.
+#                    ally    (2) — nearest allied BL_PC within skill range.
+#     Condition:     Gate condition name. (Default: always)
+#       always           — no gate; always eligible.
+#       hp_below         — self HP% < CondValue.
+#       sp_below         — self SP% < CondValue.
+#       hp_above         — self HP% > CondValue.
+#       enemy_hp_below   — target HP% < CondValue.
+#       enemy_hp_above   — target HP% > CondValue.
+#       enemy_status     — target has SC named in CondValue (e.g. SC_FREEZE).
+#       not_enemy_status — target does NOT have SC named in CondValue.
+#       self_status      — self has SC named in CondValue.
+#       not_self_status  — self does NOT have SC named in CondValue.
+#       distance_below   — distance to target <= CondValue cells.
+#       distance_above   — distance to target >  CondValue cells.
+#       enemy_count_nearby — >= CondValue enemies within detection range.
+#       map_zone         — spawned in zone matching CondValue.
+#                          String: town | field | dungeon  (numeric: 1 | 2 | 3).
+#       melee_attacked   — a melee-range enemy is targeting this shell.
+#       range_attacked   — a ranged enemy is targeting this shell.
+#       ally_hp_below    — any ally in skill range has HP% < CondValue.
+#       ally_status      — any ally in skill range has SC named in CondValue.
+#       not_ally_status  — no ally in skill range has SC named in CondValue.
+#       has_sphere       — shell has >= CondValue spirit spheres.
+#       enemy_hidden     — any enemy in detection range is hidden/cloaked.
+#       enemy_casting    — target is currently casting a skill.
+#       enemy_casting_ground — target is casting a ground-targeted skill.
+#       cell_has_skill_unit — self cell has an active skill unit on it.
+#       self_targeted    — an enemy is targeting this shell specifically.
+#       enemy_element    — target's element matches CondValue.
+#                          String: Neutral | Water | Earth | Fire | Wind | Poison | Holy | Dark | Ghost | Undead
+#                          (numeric 0–9 also accepted).
+#       enemy_race       — target's race matches CondValue.
+#                          String: Formless | Undead | Brute | Plant | Insect | Fish | Demon | DemiHuman | Angel | Dragon
+#                          (numeric 0–9 also accepted).
+#       ally_count_nearby — >= CondValue allies within detection range.
+#       enemy_is_boss    — target is an MVP/boss monster.
+#       sp_above         — self SP% > CondValue.
+#       self_being_cast_on — any nearby unit is casting a skill targeting this shell,
+#                          or casting a ground skill within CondValue cells (default 3).
+#                          Use for proactive dodge / reaction skills (e.g. Backsliding,
+#                          Safety Wall, Kyrie Eleison) before a cast lands.
+#                          Good for: AL_PNEUMA, MG_SAFETYWALL, TF_BACKSLIDING, WZ_HEAVENDRIVE counter.
+#       after_skill      — shell's previous successful cast matches CondValue skill name
+#                          (e.g. CondValue: WZ_FROSTNOVA). Enables sequential combos.
+#                          Good for: WZ_FROSTNOVA → WZ_THUNDERSTORM, MG_COLDBOLT → WZ_FROSTNOVA,
+#                          WZ_JUPITEL → WZ_LORDOFVERTUMION, SL_SMA → SL_STIN combo finishers.
+#       damaged_gt       — shell received a single hit larger than CondValue% of its max HP.
+#                          E.g. CondValue: 10 triggers when hit by >10% max HP in one blow.
+#                          Good for: HP_HEAL (reactive heal), TF_HIDING (escape burst),
+#                          AL_TELEPORT (blink on big hit), AL_PNEUMA (anti-projectile burst),
+#                          CR_DEFENDER, ST_FULLSTRIP counter setups.
+#       skill_used       — a specific skill (CondValue: skill name) was used AGAINST this shell
+#                          within the last 3 seconds. Mirrors mob_skill_db `skillused`.
+#                          Good for: AL_PNEUMA after MO_EXTREMITYFIST is used on an ally,
+#                          WZ_WATERBALL → WATERBOLT counter, TF_BACKSLIDING on MO_EXTREMITYFIST,
+#                          HP_KYRIE after detecting a high-damage skill cast on a nearby ally.
+#     CondValue:     Numeric threshold (0–100 for %/cells), or a named string value.
+#                    For *_status conditions: SC name (e.g. SC_FREEZE, or bare "freeze").
+#                    For after_skill / skill_used: skill name (e.g. WZ_FROSTNOVA).
+#                    For enemy_element: element name (Neutral/Water/Earth/Fire/Wind/Poison/Holy/Dark/Ghost/Undead).
+#                    For enemy_race: race name (Formless/Undead/Brute/Plant/Insect/Fish/Demon/DemiHuman/Angel/Dragon).
+#                    For map_zone: zone name (town/field/dungeon).
+#                    For self_being_cast_on: optional radius in cells (default 3). (Default: 0)
+#     AroundRange:   If > 0, place ground/trap skills at a random passable cell within
+#                    this radius of the shell (mirrors mob_skill_db around2/around3). (Default: 0)
+#     Cooldown:      Per-skill cooldown in milliseconds after a successful cast.
+#                    Prevents individual skill spam regardless of the global skill_cd timer.
+#                    Use for long-duration buffs (e.g. Devotion: 30000) and trap-laying. (Default: 0)
+#
+# Note: Sphere-chain jobs (Monk=15, Champion=4016) run the sphere-chain state
+#       machine first; CALLSPIRITS/FURY/ASURA entries here serve as seed fallbacks only.
+#
+###########################################################################
+# EXPANDED CONDITIONS (boolean tree DSL)
+###########################################################################
+#
+# In addition to the flat scalar form (`Condition: hp_below, CondValue: 30`),
+# `Condition:` may also be written as a YAML sequence or map to compose
+# multiple predicates with boolean logic gates. CondValue/Value are not used
+# in expanded form — thresholds are baked into the leaf tokens.
+#
+# Shapes
+# ------
+#   Condition: self_hiding              # scalar  → single leaf token
+#   Condition:                          # sequence → implicit AND of children
+#     - not_self_hiding
+#     - self_hp_pct_lt40
+#   Condition:                          # map      → AND of (gate(children))
+#     AND:                              #            per gate-key. Multiple
+#       - not_self_hiding               #            gate-keys at top level
+#     OR:                               #            are AND'd together.
+#       - self_targeted
+#       - enemy_count_nearby_ge2
+#
+# Logic gates (case-insensitive)
+# ------------------------------
+#   AND, OR, NAND, NOR, XOR, NXOR
+#
+# Leaf token grammar
+# ------------------
+#   [not_]<target>_<predicate>[_<cmp><value>[pct]]
+#
+#   target     ∈ {self, enemy, ally, master}
+#   cmp        ∈ {lt, le, gt, ge, eq}            (e.g. lt40 = "< 40")
+#   not_       optional inverter prefix
+#
+#   <predicate> resolves in this order:
+#     1. Exact legacy condition name (any token from the flat list above
+#        works inside trees, e.g. self_targeted, melee_attacked,
+#        enemy_is_boss, range_attacked, enemy_hidden, self_being_cast_on,
+#        after_skill, damaged_gt, skill_used, ...).
+#     2. Numeric kind: hp_pct, sp_pct, hp, sp, distance
+#        Requires a `_<cmp><value>` tail.
+#        Default when no comparator: treated as `gt 0`.
+#     3. Status name: bare SC name without the SC_ prefix (e.g. hiding,
+#        stun, freeze, kyrie, safetywall, explosionspirits).
+#
+# Token examples
+# --------------
+#   self_hiding                — self has SC_HIDING.
+#   not_enemy_safetywall       — target does NOT have SC_SAFETYWALL.
+#   self_hp_pct_lt40           — self HP percent < 40.
+#   enemy_hp_pct_le25          — target HP percent <= 25.
+#   self_sp_pct_ge80           — self SP percent >= 80.
+#   enemy_distance_le3         — target distance <= 3 cells.
+#   self_targeted              — legacy: shell was recently attacked.
+#   enemy_is_boss              — legacy: target is MVP/boss.
+#
+# Tree examples
+# -------------
+#   # Reactive hide: not already hidden, AND (recently hit OR low HP)
+#   Condition:
+#     AND:
+#       - not_self_hiding
+#       - OR:
+#           - self_targeted
+#           - self_hp_pct_lt40
+#
+#   # Asura finisher: full spheres, no Safety Wall, target is finishable
+#   Condition:
+#     AND:
+#       - self_explosionspirits
+#       - not_enemy_safetywall
+#       - enemy_hp_pct_lt40
+#
+#   # Cast Safety Wall when being attacked and don't already have one
+#   Condition:
+#     AND:
+#       - not_self_safetywall
+#       - OR:
+#           - melee_attacked
+#           - range_attacked
+#
+# Notes
+# -----
+#   * Sequence form is sugar for `AND:` of the same children.
+#   * `not_` on a leaf inverts that leaf only — wrap a gate in NAND/NOR/etc.
+#     to invert a whole subtree.
+#   * Empty / unparseable trees evaluate to FALSE (skill is skipped) and the
+#     map-server logs the parse error at startup.
+###########################################################################
+
+Header:
+  Type: POPULATION_SKILL_DB
+  Version: 1

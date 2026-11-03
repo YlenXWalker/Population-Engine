@@ -1,0 +1,44 @@
+# This file is a part of rAthena.
+#   Copyright(C) 2021 rAthena Development Team
+#   https://rathena.org - https://github.com/rathena
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+###########################################################################
+# Population Engine Names Database
+###########################################################################
+#
+# Fake PC name generation profiles for population shells.
+# Loaded at map-server startup and with @reloadpopengine.
+# Referenced from population_engine.yml via NameProfile: <key>.
+#
+###########################################################################
+# - GlobalLists:                 Shared word pools used by all name generation strategies.
+#     Prefixes:                  [ list ] — short prefix syllables.
+#     SyllablesStart/Mid/End:    [ list ] — syllable parts for the syllables strategy.
+#     Adjectives / Nouns:        [ list ] — word pools for the adjective_noun strategy.
+#     Blocklist:                 [ list ] — substrings to reject (case-insensitive).
+# - Profile: <key>               Named profile; reference via NameProfile: in population_engine.yml.
+#     Strategy: <value>          Name generation method:
+#       syllables      — concatenate Start + Mid + End syllable parts.
+#       adjective_noun — combine a random Adjective + Noun.
+#       adj_noun       — alias for adjective_noun.
+#       pick_one       — pick a full name directly from a Names list.
+#       bot_index      — Bot_<index> (fallback / debug).
+#       prefix_number  — <prefix><number>.
+###########################################################################
+
+Header:
+  Type: POPULATION_NAMES_DB
+  Version: 1

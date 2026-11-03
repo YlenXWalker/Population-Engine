@@ -2256,6 +2256,11 @@ void intif_parse_achievementsave(int32 fd)
  */
 int32 intif_achievement_save(map_session_data *sd)
 {
+	if (sd && IS_POPULATION_ENGINE_ACCOUNT_ID(sd->status.account_id)) {
+		sd->achievement_data.save = false;
+		return 0;
+	}
+
 	int32 len = sizeof(struct achievement) * sd->achievement_data.count + 8;
 
 	if (CheckForCharServer())

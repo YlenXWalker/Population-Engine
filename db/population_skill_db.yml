@@ -2196,3 +2196,7 @@ Body:
       - { SkillId: SC_INVISIBILITY,    Level: 5,  Rate: 5000, Target: self }
       - { SkillId: SC_INVISIBILITY,    Level: 5,  Rate: 8000, Target: self, Condition: self_targeted }
       - { SkillId: SC_ESCAPE,          Level: 5,  Rate: 5000, Target: self, Condition: hp_below, CondValue: 25 }
+
+Footer:
+  Imports:
+  - Path: db/import/population_skill_db.yml

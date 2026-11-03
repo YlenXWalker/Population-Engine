@@ -17,6 +17,7 @@ DB_PASS=ragnarok
 mysql -u $DB_ROOT -p$DB_ROOTPW -e "CREATE DATABASE $DB_NAME;" || aborterror "Unable to create database."
 mysql -u $DB_ROOT -p$DB_ROOTPW $DB_NAME < sql-files/main.sql || aborterror "Unable to import main database."
 mysql -u $DB_ROOT -p$DB_ROOTPW $DB_NAME < sql-files/logs.sql || aborterror "Unable to import logs database."
+mysql -u $DB_ROOT -p$DB_ROOTPW $DB_NAME < sql-files/population_engine/cp_population_stats.sql || aborterror "Unable to import population statistics table."
 mysql -u $DB_ROOT -p$DB_ROOTPW $DB_NAME < sql-files/item_db.sql || aborterror "Unable to import pre-renewal item table structure."
 mysql -u $DB_ROOT -p$DB_ROOTPW $DB_NAME < sql-files/item_db_usable.sql || aborterror "Unable to import pre-renewal usable item table."
 mysql -u $DB_ROOT -p$DB_ROOTPW $DB_NAME < sql-files/item_db_equip.sql || aborterror "Unable to import pre-renewal equip item table."

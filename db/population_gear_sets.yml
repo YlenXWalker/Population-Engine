@@ -470,3 +470,7 @@ Body:
       - Ring
     AccR:
       - Ring
+
+Footer:
+  Imports:
+  - Path: db/import/population_gear_sets.yml

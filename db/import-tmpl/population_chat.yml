@@ -1,0 +1,38 @@
+# This file is a part of rAthena.
+#   Copyright(C) 2021 rAthena Development Team
+#   https://rathena.org - https://github.com/rathena
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+###########################################################################
+# Population Engine Chat Database
+###########################################################################
+#
+# Map chat and whisper reply lines for population shells (UTF-8 or ASCII punctuation).
+# Lines are referenced via ChatProfile: keys defined in population_engine.yml.
+#
+###########################################################################
+# - ChatGlobal:                  Shared line categories available to all profiles.
+#     Categories:                Map of category name to list of chat strings.
+#       <name>: [ "line", ... ]  Each category holds one or more lines.
+# - ChatProfile: <key>           Named profile; reference via ChatProfile: in population_engine.yml.
+#     Categories: [ names ]      List of ChatGlobal category names to draw from (uniform random).
+#
+# Placeholders in lines: {name} {map} {job}
+# Lines matching population_names.yml Blocklist entries are skipped (substring, case-insensitive).
+###########################################################################
+
+Header:
+  Type: POPULATION_CHAT_DB
+  Version: 1
