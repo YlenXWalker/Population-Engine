@@ -108,6 +108,8 @@ Thumbs.db
 /src/tool/obj_all
 
 # /tools/
+__pycache__/
+*.pyc
 /tools/convert
 /tools/adduser
 /tools/*.exe

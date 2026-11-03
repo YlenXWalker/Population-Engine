@@ -1,4 +1,25 @@
-// Population companions are transient map-server party members (maximum four).
+//===== rAthena Script =======================================
+//= Population Companion Recruiter
+//===== By: ==================================================
+//= Louis T Steinhil
+//===== Current Version: =====================================
+//= 1.0
+//===== Compatible With: =====================================
+//= rAthena Project
+//===== Description: =========================================
+//= Lets party leaders recruit up to four Population Engine
+//= companions to follow and fight alongside their party.
+//= Creates a party for solo players and offers dismissal of
+//= all companions owned by the attached player.
+//= GM level 99 can also place a temporary hangout nearby.
+//===== Additional Comments: =================================
+//= 1.0 First version.
+//= Located in Prontera at 158,183. Requires the Population
+//= Engine C++ companion, hangout and arena job-list commands.
+//= Companions are map-server-only and are not saved to SQL.
+//= Logout, party departure and PvP/GvG/BG entry dismiss them.
+//= Hangouts remain until engine stop or server restart.
+//============================================================
 prontera,158,183,4	script	Companion Recruiter	4_M_GUNSLINGER,{
 	mes "[Companion Recruiter]";
 	mes "Choose companions to follow you and fight monsters. You must lead the party.";

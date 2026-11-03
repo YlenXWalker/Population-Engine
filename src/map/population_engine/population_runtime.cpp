@@ -1158,20 +1158,13 @@ bool population_shell_check_arena_target(map_session_data *sd, unsigned int id)
 		return false;
 	if (status_isdead(*bl))
 		return false;
-	if (sd->pop.arena_team == 2) {
-		// Allied shells (team 2) target enemy arena shells (team 1).
-		map_session_data *opp = BL_CAST(BL_PC, bl);
-		if (!opp || !population_engine_is_population_pc(id))
-			return false;
-		if (opp->pop.arena_team != 1)
-			return false;
-	} else {
-		// Enemy shells (team 1) target real (non-shell) players.
-		if (!BL_CAST(BL_PC, bl))
-			return false;
-		if (population_engine_is_population_pc(id))
-			return false;
-	}
+	auto* opp = BL_CAST(BL_PC, bl);
+	if (!opp || !opp->state.active || opp->state.warping || !opp->prev || opp->pop.arena_eliminated) return false;
+	if (population_engine_is_population_pc(id)) {
+		if (!opp->pop.arena_team || opp->pop.arena_team == sd->pop.arena_team ||
+			opp->pop.arena_owner != sd->pop.arena_owner) return false;
+	} else if (sd->pop.arena_team != 1 ||
+		(sd->pop.arena_owner && opp->status.char_id != sd->pop.arena_owner)) return false;
 	if (!path_search_long(nullptr, sd->m, sd->x, sd->y, bl->x, bl->y, CELL_CHKWALL))
 		return false;
 	if (distance_bl((block_list *)sd, bl) > AREA_SIZE)
@@ -1193,9 +1186,7 @@ static int32 arena_opponent_scan_cb(block_list *bl, va_list ap)
 	if (!opp)
 		return 0;
 	ArenaOpponentCtx *ctx = va_arg(ap, ArenaOpponentCtx*);
-	if (population_engine_is_population_pc(bl->id))
-		return 0;
-	if (status_isdead(*bl))
+	if (!population_shell_check_arena_target(ctx->attacker, bl->id))
 		return 0;
 	const int dist = distance_bl((block_list *)ctx->attacker, bl);
 	if (dist < ctx->best_dist) {
@@ -1212,11 +1203,7 @@ static int32 arena_allied_scan_cb(block_list *bl, va_list ap)
 	if (!opp)
 		return 0;
 	ArenaOpponentCtx *ctx = va_arg(ap, ArenaOpponentCtx*);
-	if (!population_engine_is_population_pc(bl->id))
-		return 0;
-	if (opp->pop.arena_team != 1)
-		return 0;
-	if (status_isdead(*bl))
+	if (!population_shell_check_arena_target(ctx->attacker, bl->id))
 		return 0;
 	const int dist = distance_bl((block_list *)ctx->attacker, bl);
 	if (dist < ctx->best_dist) {
@@ -1561,6 +1548,8 @@ TIMER_FUNC(population_engine_wander_timer)
 		if (map_id2bl(sd->id) != sd) {
 			continue;
 		}
+		if (sd->pop.arena_team || sd->pop.companion_owner)
+			continue; // Formation/follow logic owns their movement.
 
 		// Cleanup stale target exclusions. The combat tick only fires near real players,
 		// so shells on empty maps would never have their exclusion map cleaned otherwise.

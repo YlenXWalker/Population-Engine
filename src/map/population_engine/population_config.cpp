@@ -110,8 +110,8 @@ PopulationEngine::~PopulationEngine()
 
 namespace {
 
-/// Build a bonus-script-safe copy of a Script: block by removing statements whose
-/// first token is a side-effect command.  These commands call status_calc_pc or
+/// Build a bonus-script-safe copy of a Script: block by removing setup commands,
+/// including calls after if/else or inside braces. These call status_calc_pc or
 /// pc_equipitem internally; running them from pc_bonus_script would re-enter
 /// status_calc_pc and trigger "Unable to restore stack! Double continuation!".
 /// Side-effects are handled once at spawn time via run_script instead.
@@ -125,35 +125,57 @@ static std::string make_bonus_script_str(const std::string& src) {
 	std::string out;
 	out.reserve(src.size());
 	size_t pos = 0;
-	while (pos <= src.size()) {
-		size_t semi = src.find(';', pos);
-		if (semi == std::string::npos) semi = src.size();
-
-		// Find first non-whitespace character in this statement.
-		size_t s = pos;
-		while (s < semi && (src[s] == ' ' || src[s] == '\t' || src[s] == '\r' || src[s] == '\n'))
-			++s;
-
-		bool skip = false;
-		for (int i = 0; kSideEffects[i] != nullptr && !skip; ++i) {
-			const char* cmd = kSideEffects[i];
-			size_t len = strlen(cmd);
-			if (semi - s >= len && src.compare(s, len, cmd) == 0) {
-				// Ensure it isn't a longer identifier (e.g. "setriding2")
-				size_t after = s + len;
-				if (after >= semi || !(isalnum((unsigned char)src[after]) || src[after] == '_'))
-					skip = true;
+	// Walk strings/comments atomically so command-looking text and semicolons
+	// inside them cannot alter control flow. Leave an empty statement in place
+	// of each setup call so single-line if/else branches remain valid scripts.
+	auto skip_literal = [&](size_t at) -> size_t {
+		if (src[at] == '"') {
+			for (size_t i = at + 1; i < src.size(); ++i) {
+				if (src[i] == '\\' && i + 1 < src.size()) { ++i; continue; }
+				if (src[i] == '"') return i + 1;
 			}
+			return src.size();
 		}
-
-		// Keep non-empty, non-skipped statements (plus their semicolon).
-		if (!skip && s < semi) {
-			out.append(src, pos, semi - pos);
-			out += ';';
+		if (src.compare(at, 2, "//") == 0) {
+			const auto end = src.find('\n', at + 2);
+			return end == std::string::npos ? src.size() : end;
 		}
-
-		if (semi >= src.size()) break;
-		pos = semi + 1;
+		if (src.compare(at, 2, "/*") == 0) {
+			const auto end = src.find("*/", at + 2);
+			return end == std::string::npos ? src.size() : end + 2;
+		}
+		return at;
+	};
+	while (pos < src.size()) {
+		const size_t literal_end = skip_literal(pos);
+		if (literal_end != pos) {
+			out.append(src, pos, literal_end - pos);
+			pos = literal_end;
+			continue;
+		}
+		if (std::isalpha(static_cast<unsigned char>(src[pos])) || src[pos] == '_') {
+			size_t end = pos + 1;
+			while (end < src.size() && (std::isalnum(static_cast<unsigned char>(src[end])) || src[end] == '_')) ++end;
+			const std::string token = src.substr(pos, end - pos);
+			bool setup = false;
+			const bool variable = pos > 0 && (src[pos - 1] == '@' || src[pos - 1] == '.' ||
+				src[pos - 1] == '$' || src[pos - 1] == '#' || src[pos - 1] == '\'');
+			for (int i = 0; kSideEffects[i]; ++i)
+				if (!variable && token == kSideEffects[i]) { setup = true; break; }
+			if (setup) {
+				while (end < src.size() && src[end] != ';' && src[end] != '}') {
+					const size_t next = skip_literal(end);
+					end = next != end ? next : end + 1;
+				}
+				out += ';';
+				pos = end < src.size() && src[end] == ';' ? end + 1 : end;
+				continue;
+			}
+			out.append(src, pos, end - pos);
+			pos = end;
+			continue;
+		}
+		out += src[pos++];
 	}
 	return out;
 }
@@ -1818,10 +1840,10 @@ uint64 PopulationEngineDatabase::parseBodyNode(const ryml::NodeRef& node)
 
 	if (!exists) {
 		equipment->job_id = job_id;
-					if (this->m_filename_basename == "population_vendor_pop.yml") {
-						population_store_shell_profile(this->m_shell_profiles, job_id, equipment);
-					}
-					this->put(job_id, equipment);
+		if (this->m_filename_basename == "population_vendor_pop.yml") {
+			population_store_shell_profile(this->m_shell_profiles, job_id, equipment);
+		}
+		this->put(job_id, equipment);
 	}
 
 	return 1;

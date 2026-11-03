@@ -1730,7 +1730,10 @@ int32 status_damage(block_list *src,block_list *target,int64 dhp, int64 dsp, int
 		}
 	}
 
-	if( sc && sc->getSCE(SC_KAIZEL) && !map_flag_gvg2(target->m) ) { // flag&8 = disable Kaizel
+	const auto* arena_sd = BL_CAST(BL_PC, target);
+	const bool arena_eliminated = arena_sd && arena_sd->pop.arena_eliminated &&
+		(arena_sd->pop.arena_team || population_engine_arena_is_participant(arena_sd));
+	if( !arena_eliminated && sc && sc->getSCE(SC_KAIZEL) && !map_flag_gvg2(target->m) ) { // flag&8 = disable Kaizel
 		int32 time = skill_get_time2(SL_KAIZEL,sc->getSCE(SC_KAIZEL)->val1);
 		// Look for Osiris Card's bonus effect on the character and revive 100% or revive normally
 		if ( target->type == BL_PC && BL_CAST(BL_PC,target)->special_state.restart_full_recover )
@@ -1748,7 +1751,7 @@ int32 status_damage(block_list *src,block_list *target,int64 dhp, int64 dsp, int
 	}
 
 	// Disable Ultimate Sacrifice on GVG maps
-	if (sc && sc->getSCE(SC_ULTIMATE_S) && !map_flag_gvg2(target->m)) {
+	if (!arena_eliminated && sc && sc->getSCE(SC_ULTIMATE_S) && !map_flag_gvg2(target->m)) {
 		status_revive(target, 100, 100);
 		status_change_clear(target, 0);
 		clif_skill_nodamage(target, *target, ALL_RESURRECTION, 1);
@@ -1995,6 +1998,9 @@ int32 status_percent_change(block_list *src, block_list *target, int8 hp_rate, i
 int32 status_revive(block_list *bl, unsigned char per_hp, unsigned char per_sp, unsigned char per_ap)
 {
 	uint32 hp, sp, ap;
+	const auto* arena_sd = BL_CAST(BL_PC, bl);
+	if (arena_sd && arena_sd->pop.arena_eliminated &&
+		(arena_sd->pop.arena_team || population_engine_arena_is_participant(arena_sd))) return 0;
 	if (!status_isdead(*bl)) return 0;
 
 	status_data* status = status_get_status_data(*bl);

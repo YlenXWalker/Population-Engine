@@ -368,6 +368,9 @@ struct s_population {
 	uint8_t  behavior            = 2;  ///< Resolved behavior (mirrors PopulationBehavior, stored as uint8). Default: Combat.
 	uint8_t  behavior_base       = 2;  ///< Original configured behavior (for daily cycle restore).
 	int8_t   arena_team          = 0;  ///< PvP arena team (0=not in arena, 1=teamA, 2=teamB). Set by population_arena_start.
+	uint32_t arena_owner         = 0;  ///< Real participant char ID (zero for ownerless scripted arenas).
+	bool     arena_eliminated    = false; ///< Single-life arena death latch; never cleared by revival.
+	t_tick   arena_group_move_tick = 0; ///< Formation movement retry throttle.
 	int8_t   role                = 0;  ///< Combat role (0=none, 1=tank, 2=support, 3=attacker). From Role: in population_engine.yml.
 	uint8_t  db_source           = 0;  ///< PopulationDbSource (0=Main, 1=Pvp, 2=Vendor). Set at spawn time so runtime lookups can find the correct DB.
 	t_tick   last_attacked_tick  = 0;  ///< gettick() when shell last received damage (any source). Powers SelfTargeted condition for PvP / non-mob attackers.

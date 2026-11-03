@@ -51,9 +51,12 @@ void population_engine_stop();
 PopulationEngineStats population_engine_get_stats();
 bool population_engine_is_running();
 bool population_engine_is_population_pc(int32_t id);
+/// Complete a registered shell's local pc_setpos warp without a client LoadEndAck.
+/// Initial unregistered spawns are left to population_engine_place_shell.
+bool population_engine_complete_shell_warp(map_session_data* sd);
 /// Returns true if the shell has PSF::Mortal set (will take damage; default is immortal).
 bool population_engine_shell_is_mortal(const map_session_data *sd);
-/// Called from pc_dead when a mortal population shell reaches 0 HP. Schedules a respawn.
+/// Called from pc_dead: ambient/companion shells respawn; arena shells are eliminated.
 void population_engine_on_shell_death(map_session_data *sd);
 /// Called from pc_damage whenever a population shell receives damage. Records gettick() and the
 /// attacker id on sd->pop so reactive conditions (SelfTargeted, etc.) can detect non-mob attackers
@@ -72,14 +75,22 @@ void population_engine_on_global_chat_mention(map_session_data *from_sd, const c
 
 /// Arena PvP: spawn `shell_count` shells on `map_name` (must be a PvP map).
 /// Shells target real (non-shell) players on the map so a player can observe AI behaviour.
-/// Optional spawn_x/spawn_y set the spawn-center; 0 = random spread.
+/// Optional spawn_x/spawn_y set the team rally; 0 = deterministic starting lane.
 /// map_search_freecell validates walkability so shells never appear on blocked cells.
 /// Optional job_override forces every shell to use that JOB_ id (0 = use ArenaJobPool / built-in mix).
-/// team_id: 1 = enemy shells (target real players), 2 = allied shells (target team-1 shells).
+/// team_id: 1 = enemies, 2 = player allies. Owner binds both teams to one participant.
 /// Returns total shells spawned (0 on error).
 int  population_engine_arena_start(const char* map_name, int shell_count,
 								   int spawn_x = 0, int spawn_y = 0,
-								   uint16_t job_override = 0, int team_id = 1);
+								   uint16_t job_override = 0, int team_id = 1, uint32_t owner_char_id = 0);
+/// Deterministic walkable, mutually visible starting positions for both teams.
+bool population_engine_arena_rally(const char* map_name, int team_id, int16_t& x, int16_t& y);
+/// Regroup/advance an arena shell. True means hold offensive movement this tick.
+bool population_engine_arena_group_step(map_session_data* sd);
+/// True for the real participant of an owned arena on their current map.
+bool population_engine_arena_is_participant(const map_session_data* sd);
+/// Owned match state: 0=running, 1=victory, -1=defeat/left room, -2=invalid/no match.
+int population_engine_arena_result(const char* map_name, uint32_t owner_char_id);
 /// Arena PvP: release all arena shells on `map_name`.
 void population_engine_arena_stop(const char* map_name);
 
@@ -92,6 +103,7 @@ struct block_list;
 struct party;
 int population_engine_companion_recruit(map_session_data* owner, uint16_t job_id);
 int population_engine_companion_dismiss(map_session_data* owner);
+int population_engine_companion_count(const map_session_data* owner);
 void population_engine_restore_party(struct party* incoming);
 int population_engine_hangout_spawn(map_session_data* owner, uint16_t job_id);
 /// Arena PvP: classify the relation between two block_list entities so that

@@ -25,12 +25,56 @@ def production(suite):
     if suite == "cycle":
         combat = (ROOT / "src/map/population_engine/population_combat.cpp").read_text(encoding="utf-8-sig")
         return extract_function(combat, "population_shell_apply_daily_cycle")
+    if suite == "ammo_script":
+        script = (ROOT / "src/custom/script.inc").read_text(encoding="utf-8-sig")
+        return extract_function(script, "script_give_equip_ammo")
+    if suite == "ammo_select":
+        script = (ROOT / "src/custom/script.inc").read_text(encoding="utf-8-sig")
+        return extract_function(script, "script_find_first_ammo_item")
+    if suite == "bonus_filter":
+        config = (ROOT / "src/map/population_engine/population_config.cpp").read_text(encoding="utf-8-sig")
+        return extract_function(config, "make_bonus_script_str")
+    if suite == "support":
+        combat = (ROOT / "src/map/population_engine/population_combat.cpp").read_text(encoding="utf-8-sig")
+        names = ["population_shell_is_support_ally", "pop_ally_hp_scan_cb",
+                 "pop_ally_status_scan_cb", "pop_ally_any_scan_cb", "population_shell_find_ally_target"]
+        return "\n\n".join(extract_function(combat, name) for name in names)
+    if suite == "arena_group":
+        text = text.replace("\nbool population_engine_arena_group_step(",
+                            "\nstatic bool population_engine_arena_group_step(")
+        return extract_function(text, "population_engine_arena_group_step")
+    if suite == "arena_target":
+        runtime = (ROOT / "src/map/population_engine/population_runtime.cpp").read_text(encoding="utf-8-sig")
+        runtime = runtime.replace("\nbool population_shell_check_arena_target(",
+                                  "\nstatic bool population_shell_check_arena_target(")
+        return extract_function(runtime, "population_shell_check_arena_target")
+    if suite == "arena_death":
+        text = text.replace("\nvoid population_engine_on_shell_death(",
+                            "\nstatic void population_engine_on_shell_death(")
+        return extract_function(text, "population_engine_on_shell_death")
+    if suite == "arena_result":
+        text = text.replace("\nint population_engine_arena_result(",
+                            "\nstatic int population_engine_arena_result(")
+        return extract_function(text, "population_engine_arena_result")
+    if suite == "arena_cleanup":
+        text = text.replace("\nvoid population_engine_arena_stop(",
+                            "\nstatic void population_engine_arena_stop(")
+        return extract_function(text, "population_engine_arena_stop")
     if suite == "party":
         return extract_function(text.replace("\nvoid population_engine_restore_party(", "\nstatic void population_engine_restore_party("), "population_engine_restore_party")
+    if suite == "companion":
+        text = text.replace("TIMER_FUNC(population_engine_companion_timer)",
+                            "static int population_engine_companion_timer()")
+        return extract_function(text, "population_engine_companion_timer")
+    if suite == "warp":
+        text = text.replace("\nbool population_engine_complete_shell_warp(",
+                            "\nstatic bool population_engine_complete_shell_warp(")
+        return extract_function(text, "population_engine_complete_shell_warp")
     if suite == "catalog":
         config = (ROOT / "src/map/population_engine/population_config.cpp").read_text(encoding="utf-8-sig")
         return extract_function(config, "population_store_shell_profile") + "\n" + extract_function(text, "population_engine_select_vendor_spawn")
     functions = {
+        "sex": "population_engine_choose_shell_sex",
         "stats": "population_engine_initialize_shell_stats",
         "placement": "population_engine_place_shell",
         "skills": "population_engine_grant_shell_skills",
@@ -91,8 +135,44 @@ class PopulationSpawnTest(unittest.TestCase):
     def test_transient_party_refresh_owner_and_capacity(self):
         self.run_suite("party")
 
+    def test_companion_follow_waits_for_map_load_and_survives_repeated_warps(self):
+        self.run_suite("companion")
+
+    def test_clientless_warp_attachment_counters_party_and_failure(self):
+        self.run_suite("warp")
+
+    def test_ammo_script_reuses_equipped_stacks_without_repeated_equip(self):
+        self.run_suite("ammo_script")
+
+    def test_ammo_selection_checks_job_level_map_and_deterministic_weight(self):
+        self.run_suite("ammo_select")
+
+    def test_bonus_filter_removes_conditional_setup_commands(self):
+        self.run_suite("bonus_filter")
+
+    def test_companions_buff_owner_and_heal_party_not_ambient_shells(self):
+        self.run_suite("support")
+
+    def test_arena_teams_regroup_follow_player_and_reselect_dead_leader(self):
+        self.run_suite("arena_group")
+
+    def test_arena_targets_include_opposing_team_and_exclude_spectators(self):
+        self.run_suite("arena_target")
+
+    def test_arena_death_never_schedules_respawn_but_ambient_death_does(self):
+        self.run_suite("arena_death")
+
+    def test_arena_result_victory_defeat_invalid_and_cross_match_isolation(self):
+        self.run_suite("arena_result")
+
+    def test_arena_cleanup_releases_only_match_shells_and_resets_owner(self):
+        self.run_suite("arena_cleanup")
+
     def test_120_vendor_profiles_and_key_scoped_placement(self):
         self.run_suite("catalog")
+
+    def test_companion_sex_job_lock_profile_and_random_fallback(self):
+        self.run_suite("sex")
 
     def test_stat_defaults_ranges_and_random_order(self):
         self.run_suite("stats")

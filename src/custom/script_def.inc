@@ -16,9 +16,12 @@ BUILDIN_DEF(setbullet, "?"),
 BUILDIN_DEF(setkunai, "?"),
 
 // Population engine arena
-BUILDIN_DEF(population_arena_start, "si????"),
+BUILDIN_DEF(population_arena_start, "si?????"),
 BUILDIN_DEF(population_arena_stop,  "s"),
 BUILDIN_DEF(population_arena_jobs,  ""),
+BUILDIN_DEF(population_arena_position, "sii"),
+BUILDIN_DEF(population_arena_result, "si"),
+BUILDIN_DEF(population_companion_count, ""),
 
 BUILDIN_DEF(population_companion_recruit, "i"),
 BUILDIN_DEF(population_companion_dismiss, ""),

@@ -441,9 +441,8 @@ public:
 
 class PopulationVendorDatabase : public YamlDatabase {
 	std::unordered_map<std::string, PopulationVendorEntry> entries_;
-	/// Derived index: Map name -> placement constraint, populated from per-vendor
-	/// VendorPlacement: blocks during parseBodyNode. If multiple vendor entries name
-	/// the same Map, the last one parsed wins (a warning is emitted).
+	/// Map union used for placement discovery only. Spawn constraints are resolved
+	/// through placements_by_vendor_ so shops sharing a map keep their own settings.
 	std::unordered_map<std::string, PopulationVendorPlacement> placements_by_map_;
 	std::unordered_map<std::string, std::unordered_map<std::string, PopulationVendorPlacement>> placements_by_vendor_;
 

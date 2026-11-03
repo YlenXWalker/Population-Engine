@@ -3,7 +3,7 @@
 //===== By: ==================================================
 //= Louis T Steinhil
 //===== Last Updated: ========================================
-//= 20261014
+//= 20261103
 //===== Description: =========================================
 //= Server-run "shells": simulated player characters that
 //= walk, chat, hunt monsters, run vending shops and fight
@@ -47,15 +47,18 @@ db/population_vendors.yml               - Vending stock and placement
 db/population_names.yml                 - Name generation
 db/population_chat.yml                  - Chat lines
 db/import-tmpl/population_*.yml         - Import templates for db/import/
-npc/custom/population/arena.txt         - Arena Manager NPC (Morocc)
-sql-files/population_engine/population_engine.sql
+npc/custom/population/arena.txt         - Arena Manager NPC (42 town locations)
+npc/custom/population/companions.txt    - Companion Recruiter (Prontera)
+db/re/population_*.yml                 - Renewal-only third-job rows
+db/population_presets/prerenewal_4000/ - Optional 4,000-shell pre-renewal preset
+sql-files/population_engine/cp_population_stats.sql
                                         - Live shell count table
 
 ---------------------------------------
 2. Installation
 ---------------------------------------
 
-1. Import sql-files/population_engine/population_engine.sql into the main
+1. Import sql-files/population_engine/cp_population_stats.sql into the main
    database. It creates `cp_population_stats`, a single row with the live
    shell count, which the control panel's server status page shows (the
    control panel migrations create the same table). Without the table the
@@ -738,12 +741,12 @@ set; the Arena Manager NPC can set mf_pvp (.enable_pvp_flag).
 Documented in doc/script_commands.txt:
 
     population_arena_start  Spawn arena shells (map, count, center, job,
-                            team).
+                            team, optional owner char ID).
     population_arena_stop   Remove the arena shells of a map.
     population_arena_jobs   Arena job pool as a comma separated string.
-    setarrow                Equip 500 arrows for the weapon in hand.
-    setbullet               Equip 500 bullets, shells or grenades.
-    setkunai                Equip 500 kunai.
+    setarrow                Reuse or equip up to 500 eligible arrows.
+    setbullet               Reuse or equip up to 500 eligible bullets/shells/grenades.
+    setkunai                Reuse or equip up to 500 eligible kunai.
 
 setarrow, setbullet and setkunai work for any character; in a job entry's
 Script they equip the shell's ammunition (4.1).
@@ -840,6 +843,13 @@ The party must have enough free slots. Companions use the normal party display,
 heals/buffs and EXP rules, but their fake characters are never persisted to SQL.
 They follow, catch up by teleport, and follow map changes within this map-server
 process. Logout, party departure, dismissal and engine stop remove them.
+Same-map Teleport/Fly Wing and cross-map warps keep the party and ownership
+intact. The timer waits for the owner's map-load acknowledgement. Clientless
+companions finish their own warps server-side, normally within 500 ms after
+the owner finishes loading. Old-map targets and movement paths are cleared.
+Single-target buffs prioritize the real owner when their condition is met;
+healing chooses the lowest-HP eligible party member, not unrelated population
+shells. Configured skills, SP, range, status conditions and cooldowns still apply.
 They are unavailable in PvP, battleground and guild-war maps; entering one
 removes the player's companions. A cross-map-server transfer also removes them.
 The engine must be running and the job must be configured in population_engine.yml or population_pvp.yml.
@@ -847,6 +857,7 @@ The engine must be running and the job must be configured in population_engine.y
 Script commands:
   population_companion_recruit(job_id) -> 1 on success, 0 on failure
   population_companion_dismiss() -> number dismissed
+  population_companion_count() -> number owned by the attached player
 
 THIRD JOBS
 ----------
@@ -856,6 +867,23 @@ The normal job skill tree is granted; the generic skill selector can use third
 job skills. Class-specific advanced resource rotations still need live balance
 checks. Pre-renewal skips these entries. Fourth jobs are excluded from random
 population selection and are not included in the shipped profiles.
+Third-job profiles and their spawn row live in db/re/population_*.yml, imported
+only with Mode: Renewal before db/import overrides. Pre-renewal does not load
+or autosummon an absent third_jobs profile.
+
+OPTIONAL 4,000-SHELL PRE-RENEWAL PRESET
+-------------------------------------
+db/population_presets/prerenewal_4000/ contains complete replacement main,
+spawn and PvP YAML files from BanquetOfHeroes. Its distribution is 200 Novices,
+800 first jobs, 1,400 second jobs, 1,200 rebirth/transcended jobs and 400 expanded
+jobs. It covers all 46 pre-renewal ambient classes without overlapping profiles.
+Placement targets: 1,040 town, 1,555 field and 1,405 dungeon shells. Vendors,
+companions, fixed posts and arena fighters are additional to the ambient target.
+Keep the global cap above 4,000 (default 5,000). Jobs within a profile are random.
+Back up the three files in db/, copy the preset files over them and restart a
+pre-renewal build. Do not merely add them as an import: imports cannot remove
+the old profiles/job assignments. See the preset README for exact instructions.
+This preset is opt-in; standard Renewal behavior and population defaults remain.
 
 HANGOUTS
 --------
@@ -880,8 +908,30 @@ ARENAS
 Arena Manager is available in 42 town locations. Each match selects one of five
 PvP maps, then 1v1, 3v3, or 5v5 and the jobs of all opponents and allies. Rooms
 are reserved per player, preventing another player from stopping a running match.
-Canceling job selection creates no shells. Stop or logout cleans up the match;
+Canceling job selection creates no shells. Stop, match end or logout cleans up the match;
 any PvP flag added by the manager is restored. Existing PvP flags are preserved.
+Random Mix uses guarded if/else branches: this script VM evaluates both ternary
+operands, which formerly read array index -1 for Random Mix.
+Both teams start together at opposing passable rally points. Enemy shells follow
+a living leader, regroup when separated and choose a survivor after leader death.
+Allied shells follow the real participant. Idle wander/recovery movement cannot
+scatter either team. Enemies target opposing allies as well as the participant;
+unrelated spectators and other matches are excluded from owned-match targeting.
+The manager refuses entry while the player has recruited companions. Dismiss
+them first; they do not become extra arena teammates or get silently removed.
+Matches are single-life. Arena deaths never schedule population, PvP, GvG or BG
+respawns. Resurrection, Kaizel and automatic revival cannot undo elimination.
+Victory eliminates every enemy; participant death or leaving the room is defeat.
+A ten-minute limit ends a stalled match as a draw. End removes both teams,
+releases the reservation and returns the participant to the starting location.
+Normal ambient/companion death and respawn behavior is unchanged.
+
+Additional script commands:
+  population_arena_position(map, team, axis) -> rally X (axis 0) or Y (axis 1), -1 on failure
+  population_arena_result(map, owner_char_id) -> 0 running, 1 victory, -1 defeat, -2 invalid
+  population_arena_start(map, count, x, y, job, team, owner_char_id)
+The owner argument is optional for legacy scripts. The manager always supplies
+it to isolate teams, bind allied following and detect the match result.
 
 WoE/guild war simulation is deferred. This update does not add siege objectives,
 emperium targeting, guild ownership, or class-specific siege tactics.
@@ -893,8 +943,38 @@ Run: python tools/integration/test_population_spawn.py -v
 The regression harness compiles functions extracted from production source. It
 covers stats, placement, skills, equipment, scripts, behavior, vendor stock,
 spawn cleanup and a 120-profile vendor catalog with per-key map constraints.
-Clean Windows Release solution rebuild succeeded with Visual Studio 18.
-Eleven production-function suites and four configuration/map-cache suites passed locally.
+It also covers repeated warps, owner-loading intervals, ammo selection/reuse,
+conditional profile-script filtering, support targeting, arena formation,
+opponent selection, single-life death/results and bounded cleanup. Run
+tools/integration/test_population_preset.py -v for the optional 4,000-shell data.
+The population workflow runs these checks plus real Release x64 production-object
+fixtures in both PRE and RE modes. For a local Windows run, build libconfig,
+rapidyaml, common and map-server in Release x64, then execute:
+  python tools/integration/test_population_startup.py --mode RE
+Use --mode PRE with objects built using DefineConstants=PRERE. The fixture uses
+the real script compiler, builtin table, YAML loaders, map registries, warp,
+ammo, support and resurrection code without starting sockets or connecting SQL.
+Add --preset to a PRE run to load the optional preset and check the exact 4,000
+target and 46-job catalog through the real YAML loaders. Data, import templates
+and leak logs are isolated in a temporary directory; live db/import is not edited.
 Full server builds and live in-game acceptance are separate checks. In particular,
 party packets, map transitions, shop purchasing and class balance need game-client
 validation before deployment to an established server.
+
+DEPLOYMENT / TROUBLESHOOTING
+--------------------------
+These fixes were ported from BanquetOfHeroes commit 472128bc61033654182a2776c4d90e336e0122e2.
+The standalone navigation state and stock rAthena party implementation are kept;
+no Banquet autocombat, threading, assistant, control-panel or SQL dependencies
+were introduced. Rebuild and fully restart the map-server. NPC reload alone
+cannot add builtins or replace C++ warp, support or death handling. No new SQL
+migration is required; the existing cp_population_stats schema is unchanged.
+
+An "expected ';'" at population_companion_dismiss() usually means the deployed
+executable predates the builtin. Install the matching executable, not a callfunc
+workaround. Companions disappearing on warp require the rebuilt pc_setpos path.
+Repeated "setarrow: pc_equipitem failed ... ammo=1768" came from re-equipping an
+already-equipped stack. Ammo helpers now reuse stacks, select eligible ammo
+deterministically and bound grants by free weight. Profile setup commands inside
+if/else or braces are excluded from persistent bonus recalculation. Recreate
+existing shells after restarting to discard old persistent setup scripts.

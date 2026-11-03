@@ -119,6 +119,70 @@ static void population_engine_shell_index_mark_dirty()
 	g_population_shell_count_index.dirty = true;
 }
 
+bool population_engine_complete_shell_warp(map_session_data* sd)
+{
+	// Initial spawn calls pc_setpos before map_addiddb; its placement phase owns
+	// attachment and counters. Real PCs must still wait for their client ACK.
+	if (!sd || !IS_POPULATION_ENGINE_ACCOUNT_ID(sd->status.account_id) ||
+		map_id2sd(sd->id) != sd || sd->prev != nullptr)
+		return true;
+	auto* mapdata = map_getmapdata(sd->m);
+	if (!mapdata || map_addblock(sd) != 0) {
+		ShowError("Population engine: failed to attach warped shell %d to map %d.\n", sd->id, sd->m);
+		return false;
+	}
+
+	// pc_setpos removed the shell and decremented the old map's users. A fake
+	// PC has no socket to send LoadEndAck, so finish those steps synchronously.
+	sd->state.changemap = 0;
+	sd->state.connect_new = 0;
+	sd->state.warping = 0;
+	sd->state.rewarp = 0;
+	sd->state.debug_remove_map = 0;
+	if (mapdata->users++ == 0 && battle_config.dynamic_mobs)
+		map_spawnmobs(sd->m);
+	if (!pc_isinvisible(sd))
+		++mapdata->users_pvp;
+
+	// Do not resume a path or target from the old map. Keep ownership, party,
+	// skill cooldowns and buffs intact across both map warps and local teleports.
+	auto& pe = sd->pop;
+	pe.target_id = 0;
+	pe.sticky_target_id = 0;
+	pe.sticky_until = 0;
+	pe.last_attacker_id = 0;
+	pe.itempick_id = 0;
+	pe.path.clear();
+	pe.path_index = 0;
+	pe.path_last_calc_tick = 0;
+	pe.path_exec_fail_count = 0;
+	pe.recently_cleared_targets.clear();
+	pe.mob_tracker.tracked_mobs.clear();
+	pe.mob_tracker.last_scan = 0;
+	pe.mob_tracker.map_id = sd->m;
+	pe.detection_cache = {};
+	pe.mobs = {};
+	pe.nav_state = LocalNavState::DirectAdvance;
+	pe.next_nav_attempt_tick = 0;
+	pe.nav_blocked_cells = {};
+	pe.nav_blocked_cells_cursor = 0;
+	pe.type3_hotspots = {};
+	pe.lastposition.map = sd->mapindex;
+	pe.lastposition.x = sd->x;
+	pe.lastposition.y = sd->y;
+	pe.lastposition.dx = pe.lastposition.dy = 0;
+	pe.last_teleport = gettick();
+	sd->ud.canmove_tick = pe.last_teleport;
+	population_shell_reset_movement_tick_state(sd, pe.last_teleport);
+	population_engine_shell_index_mark_dirty();
+	clif_spawn(sd);
+	if (sd->status.party_id) {
+		party_send_movemap(sd);
+		clif_party_hp(*sd);
+	}
+	return true;
+}
+
 static void population_engine_shell_index_clear()
 {
 	g_population_shell_count_index.by_map.clear();
@@ -516,6 +580,17 @@ static std::string generate_bot_name(uint32_t index);
 static std::string generate_population_pc_name(uint32_t index, const PopulationEngine* cfg);
 static int16_t get_random_job_id();
 static char    get_job_required_sex(uint16_t job_id);
+
+static char population_engine_choose_shell_sex(uint16_t job_id, const PopulationEngine* config)
+{
+	const char required = get_job_required_sex(job_id);
+	if (required != '\0')
+		return required;
+	if (config && config->sex_override >= 0)
+		return config->sex_override ? 'M' : 'F';
+	return rnd() % 2 ? 'M' : 'F';
+}
+
 static uint16_t get_base_job(uint16_t job_id);
 static uint16_t get_job_weapon(uint16_t job_id);
 static uint16_t get_random_headgear(uint8_t slot);
@@ -1273,6 +1348,16 @@ TIMER_FUNC(population_engine_global_combat_timer)
 	s_pop_combat_tick_ctx ctx;
 	ctx.ticked.reserve(64);
 	map_foreachpc(pop_combat_tick_per_real_pc, &ctx);
+	// Distant formations must regroup even outside the owner's viewport.
+	for (auto* bot : g_population_engine_pcs) {
+		if (!bot || !bot->pop.arena_team || !bot->pop.arena_owner || !bot->prev ||
+			!bot->state.active || !bot->state.population_combat || ctx.ticked.count(bot->id)) continue;
+		auto* owner = map_charid2sd(bot->pop.arena_owner);
+		if (owner && owner->m == bot->m && owner->prev && owner->state.active && !owner->state.warping) {
+			ctx.ticked.insert(bot->id);
+			population_engine_combat_per_tick(bot, true);
+		}
+	}
 	return 0;
 }
 
@@ -1287,6 +1372,8 @@ TIMER_FUNC(population_engine_respawn_shell_timer)
 		return 0;
 	}
 	sd->pop.respawn_timer = INVALID_TIMER;
+	if (sd->pop.arena_team || sd->pop.arena_eliminated)
+		return 0; // Old/pending population timers must never revive arena fighters.
 	if (!g_population_engine_running) {
 		ShowDebug("PopEngine respawn: engine stopped; skipping revive for shell %u.\n", sd->id);
 		return 0;
@@ -1366,6 +1453,22 @@ void population_engine_on_shell_death(map_session_data *sd)
 {
 	if (!sd)
 		return;
+	if (sd->pop.arena_team) {
+		sd->pop.arena_eliminated = true;
+		if (sd->pop.respawn_timer != INVALID_TIMER) {
+			const TimerData* td = get_timer(sd->pop.respawn_timer);
+			if (td && td->func == population_engine_respawn_shell_timer)
+				delete_timer(sd->pop.respawn_timer, population_engine_respawn_shell_timer);
+			sd->pop.respawn_timer = INVALID_TIMER;
+		}
+		if (sd->respawn_tid != INVALID_TIMER) {
+			const TimerData* td = get_timer(sd->respawn_tid);
+			if (td)
+				delete_timer(sd->respawn_tid, td->func);
+			sd->respawn_tid = INVALID_TIMER;
+		}
+		return;
+	}
 	if (!population_engine_shell_is_mortal(sd)) {
 		ShowDebug("PopEngine death: shell %u (%s) has no Mortal flag — no respawn scheduled.\n",
 			sd->id, sd->status.name);
@@ -1443,15 +1546,20 @@ TIMER_FUNC(population_engine_companion_timer) {
 			!md || md->getMapFlag(MF_PVP) || map_flag_gvg2(owner->m) || md->getMapFlag(MF_BATTLEGROUND)) {
 			dismiss.push_back(bot); continue;
 		}
+		// The real owner still needs its client ACK. Do not warp companions into
+		// a half-loaded destination or mistake this interval for a disconnect.
+		if (!owner->state.active || owner->state.warping || owner->prev == nullptr)
+			continue;
 		bot->pop.spawn_map_id = owner->m;
 		bot->pop.spawn_x = owner->x; bot->pop.spawn_y = owner->y;
 		if (pc_isdead(bot)) continue;
-		if (bot->m != owner->m || distance_bl(bot, owner) > 14) {
+		if (bot->prev == nullptr || bot->m != owner->m || distance_bl(bot, owner) > 14) {
 			int16 x = owner->x, y = owner->y;
 			if (map_search_freecell(owner, owner->m, &x, &y, 3, 3, 0)) {
-				pc_setpos(bot, owner->mapindex, x, y, CLR_TELEPORT);
-				population_engine_shell_index_mark_dirty();
-				bot->pop.target_id = 0;
+				if (pc_setpos(bot, owner->mapindex, x, y, CLR_TELEPORT) == SETPOS_OK) {
+					population_engine_shell_index_mark_dirty();
+					bot->pop.target_id = 0;
+				}
 			}
 		} else if (distance_bl(bot, owner) > 4 && !unit_is_walking(bot)) {
 			unit_walktobl(bot, owner, 2, 0);
@@ -1496,7 +1604,7 @@ static map_session_data* population_engine_spawn_near(map_session_data* owner, u
 	if (!map_search_freecell(owner, owner->m, &x, &y, 3, 3, 0)) return nullptr;
 	uint32 index = population_engine_allocate_index();
 	if (!index) return nullptr;
-	auto* bot = population_engine_spawn_shell(owner->m, x, y, index, job_id, (get_job_required_sex(job_id) < 0 ? static_cast<char>(rnd() % 2) : get_job_required_sex(job_id)),
+	auto* bot = population_engine_spawn_shell(owner->m, x, y, index, job_id, population_engine_choose_shell_sex(job_id, cfg.get()),
 		0, 0, pick(cfg->weapon_pool), pick(cfg->shield_pool), pick(cfg->head_top_pool),
 		pick(cfg->head_mid_pool), pick(cfg->head_bottom_pool), 0, 0, pick(cfg->garment_pool),
 		cfg->script, cfg->skip_arrow, cfg.get(), 0, source);
@@ -1532,6 +1640,12 @@ int population_engine_companion_dismiss(map_session_data* owner) {
 	for (auto* bot : g_population_engine_pcs) if (bot && bot->pop.companion_owner == owner->status.char_id) dismiss.push_back(bot);
 	for (auto* bot : dismiss) population_engine_remove_managed_shell(bot);
 	return static_cast<int>(dismiss.size());
+}
+
+int population_engine_companion_count(const map_session_data* owner) {
+	if (!owner) return 0;
+	return static_cast<int>(std::count_if(g_population_engine_pcs.begin(), g_population_engine_pcs.end(),
+		[owner](const auto* bot) { return bot && bot->pop.companion_owner == owner->status.char_id; }));
 }
 
 int population_engine_hangout_spawn(map_session_data* owner, uint16_t job_id) {
@@ -3822,18 +3936,149 @@ void do_final_population_engine() {
 // Arena PvP API
 // ============================================================
 
+bool population_engine_arena_is_participant(const map_session_data* sd)
+{
+	if (!sd || population_engine_is_population_pc(sd->id)) return false;
+	return std::any_of(g_population_engine_pcs.begin(), g_population_engine_pcs.end(),
+		[sd](const auto* bot) { return bot && bot->pop.arena_team &&
+			bot->pop.arena_owner == sd->status.char_id && bot->m == sd->m; });
+}
+
+int population_engine_arena_result(const char* map_name, uint32_t owner_char_id)
+{
+	if (!map_name || !owner_char_id) return -2;
+	const int16 mid = map_mapname2mapid(map_name);
+	if (mid < 0) return -2;
+	bool found = false;
+	int enemies = 0;
+	for (const auto* bot : g_population_engine_pcs) {
+		if (!bot || !bot->pop.arena_team || bot->pop.arena_owner != owner_char_id || bot->m != mid) continue;
+		found = true;
+		if (bot->pop.arena_team == 1 && !bot->pop.arena_eliminated && !pc_isdead(bot)) ++enemies;
+	}
+	if (!found) return -2;
+	const auto* owner = map_charid2sd(owner_char_id);
+	if (!owner || owner->m != mid || owner->pop.arena_eliminated || pc_isdead(owner)) return -1;
+	return enemies == 0 ? 1 : 0;
+}
+
+bool population_engine_arena_rally(const char* map_name, int team_id, int16_t& x, int16_t& y)
+{
+	if (!map_name || (team_id != 1 && team_id != 2)) return false;
+	const int16 mid = map_mapname2mapid(map_name);
+	const auto* md = mid >= 0 ? map_getmapdata(mid) : nullptr;
+	if (!md || !md->cell) return false;
+	// Search outward from map center for two passable cells on opposite sides
+	// of the same open lane. Both teams must use the same deterministic pair.
+	const int cx = md->xs / 2, cy = md->ys / 2;
+	const int limit = std::min(64, std::max<int>(md->xs, md->ys));
+	for (int radius = 0; radius < limit; ++radius) {
+		for (int dy = -radius; dy <= radius; ++dy) {
+			for (int dx = -radius; dx <= radius; ++dx) {
+				if (std::max(std::abs(dx), std::abs(dy)) != radius) continue;
+				const int mx = cx + dx, my = cy + dy;
+				for (int axis = 0; axis < 2; ++axis) {
+					const int ax = mx - (axis == 0 ? 7 : 0), ay = my - (axis == 1 ? 7 : 0);
+					const int bx = mx + (axis == 0 ? 7 : 0), by = my + (axis == 1 ? 7 : 0);
+					if (ax < 5 || ay < 5 || bx >= md->xs - 5 || by >= md->ys - 5) continue;
+					if (!map_getcell(mid, ax, ay, CELL_CHKPASS) || !map_getcell(mid, bx, by, CELL_CHKPASS)) continue;
+					if (!path_search_long(nullptr, mid, ax, ay, bx, by, CELL_CHKWALL)) continue;
+					x = static_cast<int16_t>(team_id == 2 ? ax : bx);
+					y = static_cast<int16_t>(team_id == 2 ? ay : by);
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+static int32 population_arena_find_player_cb(block_list* bl, va_list ap) {
+	auto* sd = BL_CAST(BL_PC, bl);
+	auto** found = va_arg(ap, map_session_data**);
+	if (sd && !population_engine_is_population_pc(sd->id) && sd->state.active &&
+		!sd->state.warping && sd->prev && !pc_isdead(sd) && (!*found || sd->id < (*found)->id))
+		*found = sd;
+	return 0;
+}
+
+bool population_engine_arena_group_step(map_session_data* sd)
+{
+	if (!sd || !sd->pop.arena_team) return false;
+	auto* player = sd->pop.arena_owner ? map_charid2sd(sd->pop.arena_owner) : nullptr;
+	if (!sd->pop.arena_owner)
+		map_foreachinmap(population_arena_find_player_cb, sd->m, BL_PC, &player);
+	if (!player || player->m != sd->m || !player->state.active || player->state.warping ||
+		!player->prev || player->pop.arena_eliminated || pc_isdead(player)) {
+		population_shell_target_change(sd, 0);
+		unit_stop_attack(sd);
+		if (unit_is_walking(sd)) unit_stop_walking(sd, USW_FORCE_STOP | USW_RELEASE_TARGET);
+		return true;
+	}
+	map_session_data* leader = sd;
+	for (auto* bot : g_population_engine_pcs) {
+		if (!bot || bot->m != sd->m || bot->pop.arena_team != sd->pop.arena_team ||
+			bot->pop.arena_owner != sd->pop.arena_owner || !bot->prev ||
+			!bot->state.active || bot->pop.arena_eliminated || pc_isdead(bot)) continue;
+		if (bot->id < leader->id) leader = bot;
+	}
+	auto* anchor = sd->pop.arena_team == 2 ? player : leader;
+	const int gap = distance_bl(sd, anchor);
+	const bool regroup = anchor != sd && gap > 6;
+	bool wait_for_team = false;
+	if (leader == sd && sd->pop.arena_team == 1) {
+		for (auto* bot : g_population_engine_pcs) {
+			if (bot && bot != sd && bot->m == sd->m && bot->pop.arena_team == sd->pop.arena_team &&
+				bot->pop.arena_owner == sd->pop.arena_owner && bot->prev && !bot->pop.arena_eliminated && !pc_isdead(bot) &&
+				distance_bl(sd, bot) > 8) { wait_for_team = true; break; }
+		}
+	}
+	const bool idle = sd->pop.target_id == 0;
+	if (!regroup && !idle && !wait_for_team) return false;
+	if (regroup) {
+		population_shell_target_change(sd, 0);
+		unit_stop_attack(sd);
+	}
+	if (wait_for_team) {
+		unit_stop_attack(sd);
+		if (unit_is_walking(sd)) unit_stop_walking(sd, USW_FORCE_STOP | USW_RELEASE_TARGET);
+		return true;
+	}
+	auto* destination = sd->pop.arena_team == 1 && leader == sd ? player : anchor;
+	if (destination == sd || distance_bl(sd, destination) <= 3) {
+		if (idle && unit_is_walking(sd)) unit_stop_walking(sd, USW_FORCE_STOP | USW_RELEASE_TARGET);
+		return idle || regroup;
+	}
+	const t_tick now = gettick();
+	if (now >= sd->pop.arena_group_move_tick) {
+		sd->pop.arena_group_move_tick = now + 500;
+		population_shell_reset_movement_tick_state(sd, now);
+		if (population_shell_can_emit_movement(sd, MovementOwner::Combat, "arena:formation"))
+			unit_walktobl(sd, destination, 3, 0);
+	}
+	return true;
+}
+
 /// Spawn `shell_count` population shells on `map_name` configured for PvP.
 /// Shells target real (non-shell) players so a player can observe and engage the AI.
-/// spawn_x/y set the spawn-center (0 = random spread).
+/// spawn_x/y set the team rally (0 = deterministic opposing starting lane).
 /// map_search_freecell guarantees walkability for all spawn positions.
 /// Shells share fake party ID 0x71000000|map_id so they don't fight each other.
 /// Returns the number of shells actually spawned (0 on error).
 int population_engine_arena_start(const char* map_name, int shell_count,
 								   int spawn_x, int spawn_y,
-								   uint16_t job_override, int team_id)
+								   uint16_t job_override, int team_id, uint32_t owner_char_id)
 {
-	if (!map_name || shell_count <= 0 || shell_count > 25)
+	if (!map_name || shell_count <= 0 || shell_count > 25 || (team_id != 1 && team_id != 2))
 		return 0;
+	if (owner_char_id) {
+		auto* owner = map_charid2sd(owner_char_id);
+		if (!owner || pc_isdead(owner) || population_engine_companion_count(owner) != 0) return 0;
+		// Per-slot start calls must not reset a death already latched in a match.
+		if (std::none_of(g_population_engine_pcs.begin(), g_population_engine_pcs.end(),
+			[owner_char_id](const auto* bot) { return bot && bot->pop.arena_team && bot->pop.arena_owner == owner_char_id; }))
+			owner->pop.arena_eliminated = false;
+	}
 	const int16 mid = map_mapname2mapid(map_name);
 	if (mid < 0) {
 		ShowWarning("population_engine_arena_start: unknown map '%s'.\n", map_name);
@@ -3903,11 +4148,22 @@ int population_engine_arena_start(const char* map_name, int shell_count,
 	struct map_data* mapdata = map_getmapdata(mid);
 	if (!mapdata || !mapdata->cell)
 		return 0;
+	int16 rally_x = 0, rally_y = 0;
+	if (spawn_x <= 0 || spawn_y <= 0) {
+		if (!population_engine_arena_rally(map_name, team_id, rally_x, rally_y)) return 0;
+		spawn_x = rally_x; spawn_y = rally_y;
+	}
+	// Repeated per-slot start calls reuse their team's existing rally point.
+	for (auto* bot : g_population_engine_pcs) {
+		if (bot && bot->m == mid && bot->pop.arena_team == team_id && bot->pop.arena_owner == owner_char_id) {
+			spawn_x = bot->pop.spawn_x; spawn_y = bot->pop.spawn_y; break;
+		}
+	}
 
 	// Helper: find a walkable cell near (cx,cy) using map_search_freecell.
-	// If cx/cy are 0 or invalid, falls back to a random passable cell.
+	// Fail rather than scatter a team when its shared rally is unusable.
 	auto find_spawn_cell = [&](int cx, int cy, int &out_x, int &out_y) -> bool {
-		const int radius = 10;
+		const int radius = 2;
 		if (cx > 0 && cy > 0
 			&& cx < mapdata->xs && cy < mapdata->ys) {
 			// map_search_freecell: when src=nullptr the initial *x/*y is the center.
@@ -3920,31 +4176,7 @@ int population_engine_arena_start(const char* map_name, int shell_count,
 				return true;
 			}
 		}
-		// Fallback: random passable cell anywhere on the map.
-		for (int attempt = 0; attempt < 20; ++attempt) {
-			int16_t sx = static_cast<int16_t>(std::max(0, std::min(
-				static_cast<int>(50 + rnd() % std::max(1, static_cast<int>(mapdata->xs - 100))),
-				static_cast<int>(mapdata->xs - 1))));
-			int16_t sy = static_cast<int16_t>(std::max(0, std::min(
-				static_cast<int>(50 + rnd() % std::max(1, static_cast<int>(mapdata->ys - 100))),
-				static_cast<int>(mapdata->ys - 1))));
-			if (map_getcell(mid, sx, sy, CELL_CHKPASS)) {
-				out_x = sx;
-				out_y = sy;
-				return true;
-			}
-		}
-		// Last-resort: map_search_freecell across half the map.
-		{
-			int16_t sx = 0, sy = 0;
-			if (map_search_freecell(nullptr, mid, &sx, &sy,
-				static_cast<int16_t>(std::min(20, static_cast<int>(mapdata->xs / 2))),
-				static_cast<int16_t>(std::min(20, static_cast<int>(mapdata->ys / 2))), 1)) {
-				out_x = sx;
-				out_y = sy;
-				return true;
-			}
-		}
+		// A group spawn must never fall back to unrelated random map positions.
 		return false;
 	};
 
@@ -3956,11 +4188,9 @@ int population_engine_arena_start(const char* map_name, int shell_count,
 	(void)arena_hard_cap; // reserved for future bookkeeping
 	for (int i = 0; i < shell_count; ++i) {
 		int x = 0, y = 0;
-		// Jitter the spawn center per-iteration so multiple shells don't stack on the
-		// same cell (map_search_freecell with stack=1 can return the same cell for
-		// consecutive identical centers). Spread ~3 cells in a small ring.
-		const int jx = spawn_x + ((i % 3) - 1) * 3;
-		const int jy = spawn_y + (((i / 3) % 3) - 1) * 3;
+		// Keep each shell within two cells of the shared team rally point.
+		const int jx = spawn_x;
+		const int jy = spawn_y;
 		if (!find_spawn_cell(jx, jy, x, y))
 			continue;
 
@@ -4031,6 +4261,11 @@ int population_engine_arena_start(const char* map_name, int shell_count,
 			// Override flags to ensure mortal and set arena team marker.
 			sd->pop.flags = arena_flags;
 			sd->pop.arena_team = static_cast<int8_t>(team_id);
+			sd->pop.arena_owner = owner_char_id;
+			sd->pop.spawn_x = spawn_x; sd->pop.spawn_y = spawn_y;
+			sd->pop.profile_config = equipment;
+			sd->pop.behavior = sd->pop.behavior_base = static_cast<uint8>(PopulationBehavior::Combat);
+			population_engine_path_erase_for_pc(sd->id);
 
 			// Team-specific party ID: team-1 and team-2 shells don't buff each other.
 			const uint32_t team_base = (team_id == 2) ? 0x72000000u : 0x71000000u;
@@ -4062,11 +4297,13 @@ void population_engine_arena_stop(const char* map_name)
 	// g_population_engine_pcs between ticks; leaving freed entries there causes
 	// UB when the next sweep reads sd->id from deallocated memory.
 	std::vector<map_session_data*> to_release;
+	std::unordered_set<uint32_t> owners;
 	auto new_end = std::remove_if(g_population_engine_pcs.begin(), g_population_engine_pcs.end(),
-		[mid, &to_release](map_session_data *sd) {
+		[mid, &to_release, &owners](map_session_data *sd) {
 			if (!sd || sd->pop.arena_team == 0 || sd->m != mid)
 				return false;
 			to_release.push_back(sd);
+			if (sd->pop.arena_owner) owners.insert(sd->pop.arena_owner);
 			return true;
 		});
 	const size_t removed = static_cast<size_t>(g_population_engine_pcs.end() - new_end);
@@ -4077,9 +4314,16 @@ void population_engine_arena_stop(const char* map_name)
 		g_population_engine_count -= removed;
 	else
 		g_population_engine_count = 0;
+	if (g_population_engine_stats.active_units >= removed)
+		g_population_engine_stats.active_units -= static_cast<uint32_t>(removed);
+	else g_population_engine_stats.active_units = 0;
 
 	for (map_session_data *sd : to_release)
 		population_engine_shell_release(sd);
+	for (uint32_t cid : owners) {
+		auto* owner = map_charid2sd(cid);
+		if (owner) owner->pop.arena_eliminated = false;
+	}
 }
 
 
@@ -4126,6 +4370,10 @@ int population_engine_arena_relation(const block_list *s_bl, const block_list *t
 
 	const int s_team = s_sd->pop.arena_team;
 	const int t_team = t_sd->pop.arena_team;
+	const uint32_t owner = s_team ? s_sd->pop.arena_owner : t_sd->pop.arena_owner;
+	if (s_team && t_team && s_sd->pop.arena_owner != t_sd->pop.arena_owner) return 0;
+	if (owner && ((!s_team && (population_engine_is_population_pc(s_sd->id) || s_sd->status.char_id != owner)) ||
+		(!t_team && (population_engine_is_population_pc(t_sd->id) || t_sd->status.char_id != owner)))) return 0;
 
 	// Effective team: real players on a map that has any arena shell are
 	// implicitly team 2 (the player's side). For a relation to apply, at

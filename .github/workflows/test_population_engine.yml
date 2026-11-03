@@ -1,13 +1,26 @@
 name: Population Engine regressions
 on:
+  push:
+    branches: [main]
   pull_request:
     paths:
       - 'src/map/population_engine*'
       - 'src/map/population_engine/**'
+      - 'src/map/pc.*'
+      - 'src/map/status.cpp'
+      - 'src/custom/script*.inc'
       - 'tools/integration/population_spawn/**'
       - 'tools/integration/test_population_spawn.py'
       - 'tools/integration/test_population_config.py'
+      - 'tools/integration/test_population_preset.py'
+      - 'tools/integration/test_population_startup.py'
+      - 'tools/integration/cpp_test_tools.py'
+      - 'tools/test_population_startup.cpp'
+      - 'tools/population_*test*.cpp'
       - 'db/population*.yml'
+      - 'db/re/population*.yml'
+      - 'db/population_presets/**'
+      - 'db/**/map_cache.dat'
       - 'npc/custom/population/**'
       - '.github/workflows/test_population_engine.yml'
   workflow_dispatch:
@@ -19,3 +32,37 @@ jobs:
       - run: python3 tools/integration/test_population_spawn.py -v
       - run: python3 -m pip install pyyaml
       - run: python3 tools/integration/test_population_config.py -v
+      - run: python3 tools/integration/test_population_preset.py -v
+  production-startup:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [PRE, RE]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build Release x64 production objects
+        shell: pwsh
+        run: |
+          $defines = if ('${{ matrix.mode }}' -eq 'PRE') { 'PRERE' } else { 'POPULATION_TEST_RE' }
+          $projects = @('3rdparty/libconfig/libconfig.vcxproj', '3rdparty/rapidyaml/ryml.vcxproj', 'src/common/common.vcxproj', 'src/map/map-server.vcxproj')
+          foreach ($project in $projects) {
+            & msbuild $project /t:Build /p:Configuration=Release /p:Platform=x64 "/p:SolutionDir=$pwd\" "/p:DefineConstants=$defines" /p:MultiProcessorCompilation=false /m:2 /nologo /v:minimal
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Execute real script VM, YAML loaders, warps, support and elimination checks
+        run: python tools/integration/test_population_startup.py --mode ${{ matrix.mode }}
+      - name: Validate optional 4000-shell preset with production loaders
+        if: matrix.mode == 'PRE'
+        run: python tools/integration/test_population_startup.py --mode PRE --preset --output build/population-startup-preset
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: population-startup-${{ matrix.mode }}
+          path: |
+            build/population-startup-test/*.log
+            build/population-startup-preset/*.log

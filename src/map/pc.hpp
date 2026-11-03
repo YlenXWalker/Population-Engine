@@ -1402,6 +1402,8 @@ TIMER_FUNC(pc_close_npc_timer);
 
 void pc_setequipindex( map_session_data *sd );
 uint8 pc_isequip( const map_session_data* sd, int32 n );
+/// Equipment eligibility without inserting a candidate item into inventory.
+uint8 pc_isequip_item(const map_session_data* sd, const item_data* item, bool broken = false);
 int32 pc_equippoint( const map_session_data* sd, int32 n );
 int32 pc_equippoint_sub( const map_session_data* sd, const item_data* id );
 void pc_setinventorydata( map_session_data& sd );

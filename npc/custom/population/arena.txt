@@ -1,4 +1,25 @@
-// Shared arena manager. Each player reserves one room and chooses every job.
+//===== rAthena Script =======================================
+//= Population Arena Manager
+//===== By: ==================================================
+//= Louis T Steinhil
+//===== Current Version: =====================================
+//= 1.0
+//===== Compatible With: =====================================
+//= rAthena Project
+//===== Description: =========================================
+//= Manages Population Engine PvP matches in five arena rooms.
+//= Players choose 1v1, 3v3 or 5v5 matches and select each enemy
+//= and allied job, or use Random Mix. Both teams stay grouped.
+//= Reserves rooms per player and cleans up matches on stop or
+//= victory, defeat, timeout or logout, restoring the PvP flag.
+//= Single-life matches: defeated arena fighters stay down.
+//===== Additional Comments: =================================
+//= 1.0 First version.
+//= Requires the Population Engine C++ arena and companion
+//= count commands, plus the population PvP job database.
+//= Recruited companions must be dismissed before starting.
+//= Arena Manager duplicates are provided in 42 town locations.
+//============================================================
 -	script	Population Arena	-1,{
 	mes "[Population Arena]";
 	.@action = select("Start a match:Stop my match:Cancel");
@@ -9,16 +30,31 @@
 		close;
 	}
 	if (@pop_arena_map$ != "") { mes "Stop your current match first."; close; }
+	if (population_companion_count()) {
+		mes "Dismiss your recruited companions before starting an arena match.";
+		mes "Arena allies fill the selected team size; companions are not added as extra fighters.";
+		close;
+	}
 	.@choice = select("Arena 1:Arena 2:Arena 3:Arena 4:Arena 5:Cancel");
 	if (.@choice == 6) close;
 	.@map$ = "pvp_y_1-" + .@choice;
 	.@room = mapname2id(.@map$);
 	if (.@room <= 0) { mes "This arena is unavailable."; close; }
 	if ($@pop_arena_owner[.@room]) { mes "This arena is occupied. Choose another room."; close; }
+	.@ally_x = population_arena_position(.@map$, 2, 0);
+	.@ally_y = population_arena_position(.@map$, 2, 1);
+	.@enemy_x = population_arena_position(.@map$, 1, 0);
+	.@enemy_y = population_arena_position(.@map$, 1, 1);
+	if (.@ally_x < 0 || .@ally_y < 0 || .@enemy_x < 0 || .@enemy_y < 0) {
+		mes "This room has no suitable team starting positions.";
+		close;
+	}
 	.@size = select("1v1:3v3:5v5:Cancel");
 	if (.@size == 4) close;
 	.@enemies = .@size * 2 - 1;
-	explode(.@ids$, population_arena_jobs(), ",");
+	.@pool$ = population_arena_jobs();
+	if (.@pool$ == "") { mes "No arena job profiles are loaded."; close; }
+	explode(.@ids$, .@pool$, ",");
 	.@nj = getarraysize(.@ids$);
 	if (.@nj == 1 && .@ids$[0] == "") .@nj = 0;
 	.@menu$ = "Random Mix";
@@ -30,27 +66,84 @@
 		next;
 		.@pick = select(.@menu$);
 		if (.@pick == .@nj + 2) close;
-		.@jobs[.@i] = .@pick == 1 ? 0 : atoi(.@ids$[.@pick - 2]);
+		// Explicit branches: this VM evaluates both ternary operands.
+		// BEGIN arena job choice
+		if (.@pick == 1)
+			.@jobs[.@i] = 0;
+		else if (.@pick >= 2 && .@pick <= .@nj + 1)
+			.@jobs[.@i] = atoi(.@ids$[.@pick - 2]);
+		else
+			close;
+		// END arena job choice
 	}
 	if ($@pop_arena_owner[.@room]) { mes "Another player reserved this room."; close; }
+	if (population_companion_count()) { mes "Dismiss your companions and try again."; close; }
 	$@pop_arena_owner[.@room] = getcharid(0);
 	@pop_arena_map$ = .@map$;
 	@pop_arena_had_pvp = getmapflag(.@map$, mf_pvp);
+	@pop_arena_logging_out = 0;
+	@pop_arena_deadline = gettimetick(2) + 600;
+	@pop_arena_enter_deadline = gettimetick(2) + 10;
+	@pop_arena_entered = 0;
 	getmapxy @pop_arena_return$, @pop_arena_x, @pop_arena_y, BL_PC;
 	setmapflag .@map$, mf_pvp;
 	.@spawned = 0;
-	for (.@i = 0; .@i < 2 * .@enemies - 1; ++.@i)
-		.@spawned += population_arena_start(.@map$, 1, 0, 0, .@jobs[.@i], .@i < .@enemies ? 1 : 2);
+	for (.@i = 0; .@i < 2 * .@enemies - 1; ++.@i) {
+		if (.@i < .@enemies)
+			.@spawned += population_arena_start(.@map$, 1, .@enemy_x, .@enemy_y, .@jobs[.@i], 1, getcharid(0));
+		else
+			.@spawned += population_arena_start(.@map$, 1, .@ally_x, .@ally_y, .@jobs[.@i], 2, getcharid(0));
+	}
 	if (.@spawned < 2 * .@enemies - 1) {
 		callsub S_Stop;
 		mes "The match could not be created. Check population capacity and job profiles.";
 		close;
 	}
 	close2;
-	warp .@map$, 0, 0;
+	warp .@map$, .@ally_x, .@ally_y;
+	deltimer "Population Arena::OnMatchCheck";
+	addtimer 500, "Population Arena::OnMatchCheck";
+	end;
+
+OnMatchCheck:
+	if (@pop_arena_map$ == "") end;
+	.@room = mapname2id(@pop_arena_map$);
+	if ($@pop_arena_owner[.@room] != getcharid(0)) { callsub S_Stop; end; }
+	getmapxy .@current$, .@x, .@y, BL_PC;
+	if (!@pop_arena_entered) {
+		if (.@current$ == @pop_arena_map$)
+			@pop_arena_entered = 1;
+		else if (gettimetick(2) < @pop_arena_enter_deadline) {
+			addtimer 500, "Population Arena::OnMatchCheck";
+			end;
+		}
+	}
+	.@result = population_arena_result(@pop_arena_map$, getcharid(0));
+	if (.@result == 1) {
+		dispbottom "[Population Arena] Victory! All enemies were eliminated.";
+		callsub S_Stop;
+		end;
+	}
+	if (.@result == -1) {
+		dispbottom "[Population Arena] Defeat. You died or left the arena.";
+		callsub S_Stop;
+		end;
+	}
+	if (.@result == -2) {
+		dispbottom "[Population Arena] Match canceled: the arena fighters are no longer available.";
+		callsub S_Stop;
+		end;
+	}
+	if (gettimetick(2) >= @pop_arena_deadline) {
+		dispbottom "[Population Arena] Time limit reached. The match is a draw.";
+		callsub S_Stop;
+		end;
+	}
+	addtimer 500, "Population Arena::OnMatchCheck";
 	end;
 
 S_Stop:
+	deltimer "Population Arena::OnMatchCheck";
 	if (@pop_arena_map$ == "") return;
 	.@room = mapname2id(@pop_arena_map$);
 	if ($@pop_arena_owner[.@room] == getcharid(0)) {
@@ -59,7 +152,14 @@ S_Stop:
 		$@pop_arena_owner[.@room] = 0;
 	}
 	@pop_arena_map$ = "";
-	if (!@pop_arena_logging_out && @pop_arena_return$ != "") warp @pop_arena_return$, @pop_arena_x, @pop_arena_y;
+	@pop_arena_deadline = 0;
+	@pop_arena_enter_deadline = 0;
+	@pop_arena_entered = 0;
+	if (!@pop_arena_logging_out && @pop_arena_return$ != "") {
+		if (Hp <= 0) recovery 0, getcharid(0), 4;
+		warp @pop_arena_return$, @pop_arena_x, @pop_arena_y;
+	}
+	@pop_arena_return$ = "";
 	return;
 
 OnPCLogoutEvent:

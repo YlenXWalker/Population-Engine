@@ -1855,11 +1855,13 @@ static bool pc_isItemClass ( const map_session_data* sd, const item_data* item )
  *------------------------------------------------*/
 uint8 pc_isequip( const map_session_data* sd, int32 n )
 {
-	const item_data* item;
-
 	nullpo_retr(ITEM_EQUIP_ACK_FAIL, sd);
+	return pc_isequip_item(sd, sd->inventory_data[n], sd->inventory.u.items_inventory[n].attribute == 1);
+}
 
-	item = sd->inventory_data[n];
+uint8 pc_isequip_item(const map_session_data* sd, const item_data* item, bool broken)
+{
+	nullpo_retr(ITEM_EQUIP_ACK_FAIL, sd);
 
 	if(pc_has_permission(sd, PC_PERM_USE_ALL_EQUIPMENT))
 		return ITEM_EQUIP_ACK_OK;
@@ -1893,7 +1895,7 @@ uint8 pc_isequip( const map_session_data* sd, int32 n )
 		return ITEM_EQUIP_ACK_FAIL;
 
 	// Broken equip
-	if (sd->inventory.u.items_inventory[n].attribute == 1)
+	if (broken)
 		return ITEM_EQUIP_ACK_FAIL;
 
 	//fail to equip if item is restricted
@@ -6953,6 +6955,9 @@ enum e_setpos pc_setpos(map_session_data* sd, uint16 mapindex, int32 x, int32 y,
 
 	int16 m = map_mapindex2mapid(mapindex);
 	struct map_data *mapdata = map_getmapdata(m);
+	// Transient shells must never enter char-server transfer/authentication.
+	if (m < 0 && IS_POPULATION_ENGINE_ACCOUNT_ID(sd->status.account_id))
+		return SETPOS_NO_MAPSERVER;
 	status_change *sc = status_get_sc(sd);
 
 	sd->state.changemap = (sd->mapindex != mapindex);
@@ -7191,7 +7196,13 @@ enum e_setpos pc_setpos(map_session_data* sd, uint16 mapindex, int32 x, int32 y,
 		vending_update(*sd);
 	if (sd->state.buyingstore)
 		buyingstore_update(*sd);
-	
+
+	// Clientless population PCs cannot send CZ_NOTIFY_ACTORINIT. Reattach them
+	// before returning so combat/stale-shell timers never observe a stranded PC.
+	if (IS_POPULATION_ENGINE_ACCOUNT_ID(sd->status.account_id) &&
+		!population_engine_complete_shell_warp(sd))
+		return SETPOS_MAPINDEX;
+
 	return SETPOS_OK;
 }
 
@@ -9786,9 +9797,11 @@ int32 pc_dead(map_session_data *sd,block_list *src)
 	t_tick tick = gettick();
 	struct map_data *mapdata = map_getmapdata(sd->m);
 
+	const bool population_arena = sd->pop.arena_team != 0 || population_engine_arena_is_participant(sd);
+
 	// Activate Steel body if a super novice dies at 99+% exp [celest]
 	// Super Novices have no kill or die functions attached when saved by their angel
-	if (!sd->state.snovice_dead_flag && (sd->class_&MAPID_SECONDMASK) == MAPID_SUPER_NOVICE) {
+	if (!population_arena && !sd->state.snovice_dead_flag && (sd->class_&MAPID_SECONDMASK) == MAPID_SUPER_NOVICE) {
 		t_exp exp = pc_nextbaseexp(sd);
 
 		if( exp && get_percentage_exp(sd->status.base_exp, exp) >= 99 ) {
@@ -9888,6 +9901,9 @@ int32 pc_dead(map_session_data *sd,block_list *src)
 	}
 
 	pc_setdead(sd);
+	if (population_arena) sd->pop.arena_eliminated = true;
+	if (sd->pop.arena_team)
+		population_engine_on_shell_death(sd);
 
 	clif_party_dead( *sd );
 
@@ -10124,7 +10140,7 @@ int32 pc_dead(map_session_data *sd,block_list *src)
 	}
 	// pvp
 	// disable certain pvp functions on pk_mode [Valaris]
-	if( !battle_config.pk_mode && mapdata->getMapFlag(MF_PVP) && !mapdata->getMapFlag(MF_PVP_NOCALCRANK) ) {
+	if( !population_arena && !battle_config.pk_mode && mapdata->getMapFlag(MF_PVP) && !mapdata->getMapFlag(MF_PVP_NOCALCRANK) ) {
 		sd->pvp_point -= 5;
 		sd->pvp_lost++;
 		if( src && src->type == BL_PC ) {
@@ -10140,11 +10156,11 @@ int32 pc_dead(map_session_data *sd,block_list *src)
 		}
 	}
 	//GvG
-	if( mapdata_flag_gvg2(mapdata) ) {
+	if( !population_arena && mapdata_flag_gvg2(mapdata) ) {
 		sd->respawn_tid = add_timer(tick+1000, pc_respawn_timer, sd->id, 0);
 		return 1|8;
 	}
-	else if( sd->bg_id ) {
+	else if( !population_arena && sd->bg_id ) {
 		std::shared_ptr<s_battleground_data> bg = util::umap_find(bg_team_db, sd->bg_id);
 
 		if (bg) {
@@ -10159,8 +10175,8 @@ int32 pc_dead(map_session_data *sd,block_list *src)
 	if( battle_config.prevent_logout )
 		sd->canlog_tick = gettick() - battle_config.prevent_logout;
 
-	// Population shells with Flags: mortal respawn automatically.
-	if (population_engine_is_population_pc(sd->id))
+	// Keep ordinary population and companion respawn behavior unchanged.
+	if (!sd->pop.arena_team && population_engine_is_population_pc(sd->id))
 		population_engine_on_shell_death(sd);
 
 	// Population shell kill chat: fires on any map type (arenas, PvP, etc.)

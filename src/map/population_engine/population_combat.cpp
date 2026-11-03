@@ -256,6 +256,24 @@ struct PopAllySearchCtx {
 	map_session_data *result;          ///< Best ally found (nullptr if none)
 };
 
+/// Companions support their actual party, not the ambient shell population.
+/// Arena teams remain authoritative; ordinary ambient shells keep their social
+/// support behavior but cannot treat an unrelated companion as a public ally.
+static bool population_shell_is_support_ally(const map_session_data* shell, const map_session_data* ally)
+{
+	if (!shell || !ally || shell == ally || shell->m != ally->m ||
+		!ally->state.active || ally->state.warping || ally->prev == nullptr || ally->pop.arena_eliminated || status_isdead(*ally))
+		return false;
+	if (shell->pop.arena_team || ally->pop.arena_team)
+		return population_engine_arena_is_ally(shell, ally);
+	const bool same_party = shell->status.party_id != 0 && shell->status.party_id == ally->status.party_id;
+	if (shell->pop.companion_owner)
+		return same_party;
+	if (ally->pop.companion_owner)
+		return same_party;
+	return same_party || ally->state.population_combat;
+}
+
 /// Scan callback: finds the living ally with the lowest HP% below hp_threshold.
 static int32 pop_ally_hp_scan_cb(block_list *bl, va_list ap)
 {
@@ -263,10 +281,7 @@ static int32 pop_ally_hp_scan_cb(block_list *bl, va_list ap)
 	if (!ally) return 0;
 	PopAllySearchCtx *ctx = va_arg(ap, PopAllySearchCtx*);
 	if (ally->id == ctx->shell->id) return 0;
-	// Real players are skipped UNLESS they are an arena ally of this shell
-	// (team-2 shell + real player on the same arena map = mutual allies).
-	if (!ally->state.population_combat
-		&& !population_engine_arena_is_ally(ctx->shell, ally))
+	if (!population_shell_is_support_ally(ctx->shell, ally))
 		return 0;
 	if (!ally->state.active || ally->state.warping) return 0;
 	if (status_isdead(*ally)) return 0;
@@ -349,8 +364,7 @@ static int32 pop_ally_status_scan_cb(block_list *bl, va_list ap)
 	if (!ally) return 0;
 	PopAllySearchCtx *ctx = va_arg(ap, PopAllySearchCtx*);
 	if (ally->id == ctx->shell->id) return 0;
-	if (!ally->state.population_combat
-		&& !population_engine_arena_is_ally(ctx->shell, ally))
+	if (!population_shell_is_support_ally(ctx->shell, ally))
 		return 0;
 	if (!ally->state.active || ally->state.warping) return 0;
 	if (status_isdead(*ally)) return 0;
@@ -371,8 +385,7 @@ static int32 pop_ally_any_scan_cb(block_list *bl, va_list ap)
 	if (!ally) return 0;
 	PopAllySearchCtx *ctx = va_arg(ap, PopAllySearchCtx*);
 	if (ally->id == ctx->shell->id) return 0;
-	if (!ally->state.population_combat
-		&& !population_engine_arena_is_ally(ctx->shell, ally))
+	if (!population_shell_is_support_ally(ctx->shell, ally))
 		return 0;
 	if (!ally->state.active || ally->state.warping) return 0;
 	if (status_isdead(*ally)) return 0;
@@ -420,6 +433,19 @@ static map_session_data* population_shell_find_ally_target(
 	ctx.want_has_status = false;
 	ctx.best_hp_pct     = 101;
 	ctx.result          = nullptr;
+
+	// Buff the real owner before nearby party shells when the owner satisfies
+	// this skill's condition. Healing still scans for the lowest-HP party member.
+	if (sd->pop.companion_owner && cond != C::AllyHpBelow) {
+		auto* owner = map_charid2sd(sd->pop.companion_owner);
+		if (population_shell_is_support_ally(sd, owner) && distance_bl(sd, owner) <= scan_range) {
+			const auto* sc = status_get_sc(owner);
+			const bool has_status = sc_resolved >= 0 && sc && sc->hasSCE(static_cast<sc_type>(sc_resolved));
+			if (cond == C::Always || (sc_resolved >= 0 &&
+				((cond == C::AllyStatus && has_status) || (cond == C::NotAllyStatus && !has_status))))
+				return owner;
+		}
+	}
 
 	switch (cond) {
 	case C::AllyHpBelow:
@@ -1916,7 +1942,7 @@ int population_engine_combat_per_tick(map_session_data *sd, bool do_skills)
 {
 	if (sd == nullptr)
 		return -1;
-	if (pc_isdead(sd))
+	if (pc_isdead(sd) || sd->pop.arena_eliminated)
 		return 0;
 	s_population &pe = sd->pop;
 	if (static_cast<PopulationBehavior>(pe.behavior_base) == PopulationBehavior::Hangout) {
@@ -1956,8 +1982,13 @@ int population_engine_combat_per_tick(map_session_data *sd, bool do_skills)
 	// Arena mode: shells target real players on the map (player-vs-shells observation).
 	if (sd->pop.arena_team > 0) {
 		population_shell_reset_movement_tick_state(sd, current_tick);
-		// Reset movement owner SM so stuck target-lock and timed-out states clear.
-		population_shell_status_check_reset(sd, current_tick);
+		// Drop a stale attack without the generic reset's random recovery step;
+		// the formation is the only idle/recovery movement owner in an arena.
+		if (!unit_is_walking(sd) && pe.target_id &&
+			DIFF_TICK(current_tick, pe.last_attack) > PE_SHELL_TARGET_ATTACK_TIMEOUT_MS) {
+			population_shell_target_change(sd, 0);
+			pe.last_attack = current_tick;
+		}
 		const uint32 arena_tid = static_cast<uint32>(pe.target_id);
 		// Validate current arena target.
 		if (arena_tid > 0 && !population_shell_check_arena_target(sd, arena_tid))
@@ -1967,6 +1998,7 @@ int population_engine_combat_per_tick(map_session_data *sd, bool do_skills)
 			const unsigned int opp = population_shell_find_arena_opponent(sd);
 			population_shell_target_change(sd, static_cast<int>(opp));
 		}
+		const bool hold_formation = population_engine_arena_group_step(sd);
 
 		const bool flag_attack_only = (sd->pop.flags & PSF::AttackOnly) != 0
 		|| sd->sc.getSCE(SC_BERSERK) != nullptr; // Frenzy: auto-attack only, no skills
@@ -1992,7 +2024,7 @@ int population_engine_combat_per_tick(map_session_data *sd, bool do_skills)
 		}
 
 		// 3. Offensive skills + basic attack against the player.
-		if (pe.target_id) {
+		if (pe.target_id && !hold_formation) {
 			uint16 skill_id = 0, skill_lv = 0;
 			if (!flag_attack_only && do_skills && current_tick >= pe.skill_cd && battle_config.population_engine_shell_attackskill) {
 				block_list *tbl = map_id2bl(static_cast<int>(pe.target_id));
@@ -2271,7 +2303,6 @@ bool population_engine_combat_try_start(map_session_data *sd)
 		pe.lastposition.x = sd->x;
 		pe.lastposition.y = sd->y;
 	}
-	sd->state.population_combat = false;
 	sd->state.population_combat = false;
 
 	population_engine_apply_shell_hat_effect(sd, true);

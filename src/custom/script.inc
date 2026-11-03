@@ -35,17 +35,22 @@ static enum weapon_type script_handr_weapon_subtype(map_session_data *sd)
 		return (enum weapon_type)sd->weapontype1;
 	return W_FIST;
 }
-
-static t_itemid script_find_first_ammo_item(enum e_ammo_type ammo_subtype)
+static t_itemid script_find_first_ammo_item(map_session_data* sd, enum e_ammo_type ammo_subtype)
 {
+	t_itemid selected = 0;
+	int selected_weight = INT_MAX;
 	for (const auto& it : item_db) {
 		std::shared_ptr<item_data> id = it.second;
 		if (!id || id->nameid == UNKNOWN_ITEM_ID)
 			continue;
-		if (id->type == IT_AMMO && id->subtype == ammo_subtype && id->equip && (id->equip & EQP_AMMO))
-			return id->nameid;
+		if (id->type == IT_AMMO && id->subtype == ammo_subtype && (id->equip & EQP_AMMO) &&
+			pc_isequip_item(sd, id.get()) == ITEM_EQUIP_ACK_OK &&
+			(id->weight < selected_weight || (id->weight == selected_weight && (!selected || id->nameid < selected)))) {
+			selected = id->nameid;
+			selected_weight = id->weight;
+		}
 	}
-	return 0;
+	return selected;
 }
 
 static bool script_give_equip_ammo(map_session_data *sd, const char *cmd, t_itemid ammo_id)
@@ -53,17 +58,35 @@ static bool script_give_equip_ammo(map_session_data *sd, const char *cmd, t_item
 	nullpo_retr(false, sd);
 	nullpo_retr(false, cmd);
 	std::shared_ptr<item_data> aid = item_db.find(ammo_id);
-	if (!aid || !aid->equip) {
+	if (!aid || aid->type != IT_AMMO || !(aid->equip & EQP_AMMO)) {
 		ShowWarning("%s: ammo item %u missing or has no equip flags (%s id=%d)\n",
 			cmd, (unsigned)ammo_id, sd->status.name, sd->id);
 		return false;
 	}
+	// Recalculation and repeated script calls must not add or re-equip an
+	// already equipped stack: pc_equipitem deliberately rejects that request.
+	for (int16 i = 0; i < MAX_INVENTORY; ++i) {
+		const auto& slot = sd->inventory.u.items_inventory[i];
+		if (slot.nameid != ammo_id || slot.amount <= 0)
+			continue;
+		if ((slot.equip & EQP_AMMO) && sd->equip_index[EQI_AMMO] == i)
+			return true;
+		if (slot.equip == 0)
+			return pc_equipitem(sd, i, EQP_AMMO, false);
+	}
+	int amount = 500;
+	if (aid->weight > 0) {
+		const int available = sd->max_weight > sd->weight ? sd->max_weight - sd->weight : 0;
+		amount = std::min(amount, available / static_cast<int>(aid->weight));
+	}
+	if (amount <= 0)
+		return false;
 	struct item tmp_item = {};
 	tmp_item.nameid = ammo_id;
-	tmp_item.amount = 500;
+	tmp_item.amount = amount;
 	tmp_item.identify = 1;
 	tmp_item.equip = 0;
-	enum e_additem_result ares = pc_additem(sd, &tmp_item, 500, LOG_TYPE_NONE, false);
+	enum e_additem_result ares = pc_additem(sd, &tmp_item, amount, LOG_TYPE_NONE, false);
 	if (ares != ADDITEM_SUCCESS) {
 		ShowWarning("%s: pc_additem ammo %u failed result=%d (%s id=%d max_w=%d cur_w=%d slots=%d)\n",
 			cmd, (unsigned)ammo_id, (int)ares, sd->status.name, sd->id,
@@ -72,6 +95,8 @@ static bool script_give_equip_ammo(map_session_data *sd, const char *cmd, t_item
 	}
 	for (int16 i = 0; i < MAX_INVENTORY; i++) {
 		if (sd->inventory.u.items_inventory[i].nameid == ammo_id && sd->inventory.u.items_inventory[i].amount > 0) {
+			if ((sd->inventory.u.items_inventory[i].equip & EQP_AMMO) && sd->equip_index[EQI_AMMO] == i)
+				return true;
 			if (!pc_equipitem(sd, i, aid->equip, false)) {
 				ShowWarning("%s: pc_equipitem failed inv=%d ammo=%u (%s id=%d)\n",
 					cmd, (int)i, (unsigned)ammo_id, sd->status.name, sd->id);
@@ -102,9 +127,9 @@ BUILDIN_FUNC(setarrow)
 	if (wt != W_BOW && wt != W_MUSICAL && wt != W_WHIP)
 		return SCRIPT_CMD_SUCCESS;
 
-	t_itemid arrow_id = script_find_first_ammo_item(AMMO_ARROW);
+	t_itemid arrow_id = script_find_first_ammo_item(sd, AMMO_ARROW);
 	if (arrow_id == 0)
-		arrow_id = 1750; // Steel Arrow fallback
+		return SCRIPT_CMD_SUCCESS; // No legal arrow for this job/level/map.
 
 	script_give_equip_ammo(sd, "setarrow", arrow_id);
 
@@ -126,14 +151,14 @@ BUILDIN_FUNC(setbullet)
 	case W_REVOLVER:
 	case W_RIFLE:
 	case W_GATLING:
-		ammo_id = script_find_first_ammo_item(AMMO_BULLET);
+		ammo_id = script_find_first_ammo_item(sd, AMMO_BULLET);
 		break;
 	case W_SHOTGUN:
-		ammo_id = script_find_first_ammo_item(AMMO_SHELL);
+		ammo_id = script_find_first_ammo_item(sd, AMMO_SHELL);
 		break;
-#ifdef RENEWAL
+#ifndef RENEWAL
 	case W_GRENADE:
-		ammo_id = script_find_first_ammo_item(AMMO_GRENADE);
+		ammo_id = script_find_first_ammo_item(sd, AMMO_GRENADE);
 		break;
 #endif
 	default:
@@ -163,7 +188,7 @@ BUILDIN_FUNC(setkunai)
 	if (wt != W_HUUMA)
 		return SCRIPT_CMD_SUCCESS;
 
-	t_itemid kunai_id = script_find_first_ammo_item(AMMO_KUNAI);
+	t_itemid kunai_id = script_find_first_ammo_item(sd, AMMO_KUNAI);
 	if (kunai_id == 0) {
 		ShowWarning("setkunai: no AMMO_KUNAI with EQP_AMMO in item_db (%s id=%d)\n", sd->status.name, sd->id);
 		return SCRIPT_CMD_SUCCESS;
@@ -176,10 +201,10 @@ BUILDIN_FUNC(setkunai)
 
 /*==========================================
  * Population Engine Arena Commands
- * population_arena_start("<map>", <shell_count>{, <spawn_x>, <spawn_y>})
+ * population_arena_start("<map>", <shell_count>{, <spawn_x>, <spawn_y>, <job>, <team>, <owner_char_id>})
  *   Spawns shell_count shells on <map> (must have PvP mode enabled).
  *   Shells target real (non-shell) players so a player can fight/observe AI behaviour.
- *   spawn_x/spawn_y = optional spawn center (0 = random spread).
+ *   spawn_x/spawn_y = optional team rally (0 = deterministic opposing lane).
  *   Returns shells spawned or 0 on error.
  * population_arena_stop("<map>")
  *   Releases all arena shells on <map>.
@@ -206,9 +231,14 @@ BUILDIN_FUNC(population_arena_start)
 	}
 	// team_id: 1 = enemy shells (target real players), 2 = allied shells (target team-1 shells).
 	const int team_arg = script_hasdata(st, 7) ? script_getnum(st, 7) : 1;
+	const int owner_arg = script_hasdata(st, 8) ? script_getnum(st, 8) : 0;
+	if ((team_arg != 1 && team_arg != 2) || owner_arg < 0) {
+		script_pushint(st, 0);
+		return SCRIPT_CMD_FAILURE;
+	}
 
 	const int spawned = population_engine_arena_start(map_name, shell_count, sx, sy,
-		static_cast<uint16_t>(job_arg), team_arg);
+		static_cast<uint16_t>(job_arg), team_arg, static_cast<uint32_t>(owner_arg));
 	script_pushint(st, spawned);
 	return SCRIPT_CMD_SUCCESS;
 }
@@ -217,6 +247,23 @@ BUILDIN_FUNC(population_arena_stop)
 {
 	const char* map_name = script_getstr(st, 2);
 	population_engine_arena_stop(map_name);
+	return SCRIPT_CMD_SUCCESS;
+}
+
+BUILDIN_FUNC(population_arena_result)
+{
+	const int owner = script_getnum(st, 3);
+	script_pushint(st, owner > 0 ? population_engine_arena_result(script_getstr(st, 2), static_cast<uint32_t>(owner)) : -2);
+	return SCRIPT_CMD_SUCCESS;
+}
+
+BUILDIN_FUNC(population_arena_position)
+{
+	const int team = script_getnum(st, 3), axis = script_getnum(st, 4);
+	int16 x = 0, y = 0;
+	const bool ok = (axis == 0 || axis == 1) &&
+		population_engine_arena_rally(script_getstr(st, 2), team, x, y);
+	script_pushint(st, ok ? (axis == 0 ? x : y) : -1);
 	return SCRIPT_CMD_SUCCESS;
 }
 
@@ -239,24 +286,52 @@ BUILDIN_FUNC(population_arena_jobs)
 	return SCRIPT_CMD_SUCCESS;
 }
 
-BUILDIN_FUNC(population_companion_recruit) {
+/*==========================================
+ * Population companions and administrator hangout placement.
+ *------------------------------------------*/
+BUILDIN_FUNC(population_companion_recruit)
+{
 	map_session_data* sd;
-	if (!script_rid2sd(sd)) { script_pushint(st, 0); return SCRIPT_CMD_FAILURE; }
-	int job = script_getnum(st, 2);
+	if (!script_rid2sd(sd)) {
+		script_pushint(st, 0);
+		return SCRIPT_CMD_FAILURE;
+	}
+	const int job = script_getnum(st, 2);
 	script_pushint(st, job > 0 && job <= UINT16_MAX ? population_engine_companion_recruit(sd, static_cast<uint16_t>(job)) : 0);
 	return SCRIPT_CMD_SUCCESS;
 }
-BUILDIN_FUNC(population_companion_dismiss) {
+
+BUILDIN_FUNC(population_companion_dismiss)
+{
 	map_session_data* sd;
-	if (!script_rid2sd(sd)) { script_pushint(st, 0); return SCRIPT_CMD_FAILURE; }
+	if (!script_rid2sd(sd)) {
+		script_pushint(st, 0);
+		return SCRIPT_CMD_FAILURE;
+	}
 	script_pushint(st, population_engine_companion_dismiss(sd));
 	return SCRIPT_CMD_SUCCESS;
 }
-BUILDIN_FUNC(population_hangout_spawn) {
+
+BUILDIN_FUNC(population_companion_count)
+{
 	map_session_data* sd;
-	if (!script_rid2sd(sd)) { script_pushint(st, 0); return SCRIPT_CMD_FAILURE; }
-	int job = script_getnum(st, 2);
+	if (!script_rid2sd(sd)) {
+		script_pushint(st, 0);
+		return SCRIPT_CMD_FAILURE;
+	}
+	script_pushint(st, population_engine_companion_count(sd));
+	return SCRIPT_CMD_SUCCESS;
+}
+
+BUILDIN_FUNC(population_hangout_spawn)
+{
+	map_session_data* sd;
+	if (!script_rid2sd(sd)) {
+		script_pushint(st, 0);
+		return SCRIPT_CMD_FAILURE;
+	}
+	const int job = script_getnum(st, 2);
 	// Placement is an administrator tool; ordinary players cannot populate maps.
-	script_pushint(st, sd->group->level >= 99 && job > 0 && job <= UINT16_MAX ? population_engine_hangout_spawn(sd, static_cast<uint16_t>(job)) : 0);
+	script_pushint(st, pc_get_group_level(sd) >= 99 && job > 0 && job <= UINT16_MAX ? population_engine_hangout_spawn(sd, static_cast<uint16_t>(job)) : 0);
 	return SCRIPT_CMD_SUCCESS;
 }
